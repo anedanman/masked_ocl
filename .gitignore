@@ -1,3 +1,18 @@
+# Datasets (all forlders inside data/)
+data/*/
+
+# Generated config files 
+configs/generated/*
+
+# External repos
+dinov3/
+dinov3_ckpts/
+vjepa2/
+
+# Training logs and checkpoints 
+wandb/
+runs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -186,7 +201,7 @@ cython_debug/
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
 #  and can be added to the global gitignore or merged into this file. However, if you prefer, 
 #  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 
 # Ruff stuff:
 .ruff_cache/
