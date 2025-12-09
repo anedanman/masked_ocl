@@ -1,0 +1,116 @@
+train:
+  max_updates: 100000
+  val_every_updates: 5000
+  log_every_updates: 600
+  use_tqdm: true
+  seed: 39
+  deterministic: false
+  compile:
+    enabled: false
+    mode: reduce-overhead  # options: default, reduce-overhead, max-autotune
+    fullgraph: false
+  # Reconstruction loss for Slot-MAE: 'l1' or 'l2'
+  reconstruction_loss: l2
+  batch_size: 256
+  val_batch_size: 64
+  gradient_accumulation_steps: 1
+  num_workers: 16
+  val_num_workers: 4
+  images_only: true
+  return_properties: false
+  max_samples_train: null
+  max_samples_val: 2000
+  max_val_batches: 20
+  grad_clip_norm: 1.0
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  lr_schedule:
+    type: cosine
+    warmup_steps: 10000
+    min_lr: 1.0e-6
+  ckpt:
+    every_updates: 5000
+    keep_last: 3
+    resume_path: null
+    resume_latest: false
+
+data:
+  dataset: coco
+  root: ./data/coco
+  image_size: 256
+  max_objects: 70
+  train_split: train2017
+  val_split: val2017
+  min_area: 0.0
+  train_horizontal_flip_prob: 0.5
+
+dino:
+  size: s # num_channels s: 384, b: 768, l: 1024
+  freeze: true
+  compile: false
+
+slots:
+  num_iterations: 3
+  num_slots: 7
+  num_heads: 1
+  slot_size: 384
+  input_size: null
+  out_size: null
+  mlp_hidden_size: 1536
+  detach_last_iteration: true
+  qk_rmsnorm: false
+  qk_rmsnorm_eps: 1.0e-6
+  rope: {}
+  # For masked pass: use teacher-guided attention with straight-through grads
+  guided_grad_substitute: true
+
+decoder:
+  variant: mae  # options: mae (Slot-MAE style), jepa (Slot-JEPA style)
+  type: autoregressive  # options: mlp, transformer, autoregressive
+  num_heads: 6
+  transformer:
+    qk_norm: true
+    depth: 4
+    mlp_hidden_dim: 1536
+    pre_mlp: true
+    dropout: 0.15
+    rope: {}
+  autoregressive:
+    qk_norm: true
+    depth: 6
+    mlp_hidden_dim: 1536
+    dropout: 0.1
+    order: random  # options: random, left_to_right
+    mode: slate     # options: spot, slate
+    permutation_probability:
+      start_value: 1.0
+      end_value: 1.0
+      start_step: 0
+      end_step: 0
+    rope: {}
+  mlp:
+    hidden_dim: 1536
+    depth: 2
+    rope: {}
+
+masking:
+  ratio: 0.75
+  min_tokens: 8
+  secondary_unmask_ratio: 0.15
+  dilate_kernel_size: null
+  dilate_iterations: 0
+  # ratio_schedule:
+  #   type: linear
+  #   start: 0.01
+  #   end: 0.7
+  #   steps: 10000
+
+wandb:
+  enabled: true
+  project: slot-dino
+  entity: null
+  run_name: mae_coco_mask0.75_autoregressive_Sdino_random_128b
+  mode: online
+
+output:
+  dir: runs

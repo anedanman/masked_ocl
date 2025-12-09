@@ -1,0 +1,104 @@
+train:
+  # Control training by total number of updates (steps)
+  max_updates: 150002
+  # Validation and logging intervals (in updates)
+  val_every_updates: 10000
+  log_every_updates: 1000
+  progress_bar: true
+  seed: 39
+  deterministic: false
+  panoptic_mode: instance
+  # Checkpointing by updates
+  ckpt:
+    every_updates: 10000
+    keep_last: 1
+    resume_path: null    # path to a checkpoint to resume from
+    resume_latest: false # if true and resume_path is null, resume from latest in output.dir
+  # Optim/loader
+  batch_size: 64
+  gradient_accumulation_steps: 2
+  val_batch_size: 32
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-4
+  lr_schedule:
+    type: cosine
+    warmup_steps: 2
+    min_lr: 1.0e-5
+  num_workers: 16
+  val_num_workers: 4
+  grad_clip_norm: 1.0
+  compile:
+    enabled: true
+    mode: "reduce-overhead" # options: "default", "reduce-overhead", "max-autotune"
+  images_only: true
+  max_samples_train: null
+  max_samples_val: 1200
+  max_val_batches: 12
+  min_area: 0.0
+  return_properties: false
+
+data:
+  dataset: coco
+  root: ./data/coco
+  image_size: 256
+  max_objects: 60
+  train_split: train2017
+  val_split: val2017
+  train_horizontal_flip_prob: 0.5
+
+dino:
+  size: b
+  freeze: true
+
+slots:
+  num_iterations: 3
+  num_slots: 7
+  num_heads: 1
+  slot_size: 768
+  input_size: null  # auto from DINO feature dim
+  out_size: null    # auto from DINO feature dim
+  mlp_hidden_size: 2048
+  detach_last_iteration: true
+  qk_rmsnorm: false
+  qk_rmsnorm_eps: 1.0e-6
+  rope:
+    rescale_coords: null
+    shift_coords: null
+    jitter_coords: null
+
+decoder:
+  type: autoregressive  # options: mlp, transformer, autoregressive
+  num_heads: 6
+  transformer:
+    qk_norm: true
+    depth: 4
+    mlp_hidden_dim: 1024
+    pre_mlp: true
+    dropout: 0.1
+    rope: {}
+  mlp:
+    hidden_dim: 1024
+    depth: 2
+    rope: {}
+  autoregressive:
+    qk_norm: false
+    depth: 10
+    mlp_hidden_dim: 2048
+    dropout: 0.1
+    order: random  # options: random, basic
+    permutation_probability:
+      start_value: 1.0
+      end_value: 0.0
+      start_step: 50000
+      end_step: 100000
+    rope: {}
+
+wandb:
+  enabled: true
+  project: slot-dino
+  entity: null
+  run_name: dinosaur_coco_autoregressive_7objs_detach_bdino_random_10depth
+  mode: online
+
+output:
+  dir: runs

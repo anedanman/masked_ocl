@@ -1,0 +1,88 @@
+train:
+  max_updates: 300000
+  val_every_updates: 10000
+  log_every_updates: 10000
+  progress_bar: true
+  seed: null
+  deterministic: false
+  ckpt:
+    every_updates: 10000
+    keep_last: 3
+    resume_path: null
+    resume_latest: false
+  batch_size: 64
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  lr_schedule:
+    type: cosine
+    warmup_steps: 10000
+    min_lr: 1.0e-6
+  num_workers: 8
+  grad_clip_norm: 1.0
+  compile:
+    enabled: true
+    mode: "reduce-overhead"
+  images_only: true
+  max_samples_train: null
+  max_samples_val: null
+  min_area: 0.0
+  return_properties: true
+
+data:
+  dataset: clevrtex
+  root: ./data/clevrtex
+  variant: full
+  image_size: 256
+  max_objects: 10
+  max_samples: null
+  train_horizontal_flip_prob: 0.0
+  split:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+    seed: 42
+
+dino:
+  size: s
+  freeze: true
+
+slots:
+  num_iterations: 5
+  num_slots: 11
+  num_heads: 1
+  slot_size: 256
+  input_size: null
+  out_size: null
+  mlp_hidden_size: 512
+  detach_last_iteration: false
+  qk_rmsnorm: false
+  qk_rmsnorm_eps: 1.0e-6
+  rope:
+    rescale_coords: null
+    shift_coords: null
+    jitter_coords: null
+
+decoder:
+  type: mlp
+  num_heads: 1
+  transformer:
+    qk_norm: true
+    depth: 2
+    mlp_hidden_dim: 512
+    pre_mlp: true
+    dropout: 0.0
+    rope: {}
+  mlp:
+    hidden_dim: 1024
+    depth: 3
+    rope: {}
+
+wandb:
+  enabled: true
+  project: slot-dino
+  entity: null
+  run_name: dinosaur_clevrtex_mlp_nodetach
+  mode: online
+
+output:
+  dir: runs

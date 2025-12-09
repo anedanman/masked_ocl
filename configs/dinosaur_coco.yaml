@@ -1,0 +1,92 @@
+train:
+  # Control training by total number of updates (steps)
+  max_updates: 300000
+  # Validation and logging intervals (in updates)
+  val_every_updates: 1000
+  log_every_updates: 10000
+  progress_bar: true
+  seed: null
+  deterministic: false
+  panoptic_mode: instance
+  # Checkpointing by updates
+  ckpt:
+    every_updates: 10000
+    keep_last: 3
+    resume_path: null    # path to a checkpoint to resume from
+    resume_latest: false # if true and resume_path is null, resume from latest in output.dir
+  # Optim/loader
+  batch_size: 64
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  lr_schedule:
+    type: cosine
+    warmup_steps: 10000
+    min_lr: 1.0e-6
+  num_workers: 4  # Reduced from 8 since data is cached in RAM
+  grad_clip_norm: 1.0
+  compile:
+    enabled: true
+    mode: "reduce-overhead"
+  images_only: true
+  max_samples_train: null  # ~25 GB RAM for caching (fits in your 28GB available)
+  max_samples_val: 200
+  min_area: 0.0
+  return_properties: true
+
+data:
+  dataset: coco
+  root: ./data/coco
+  image_size: 256
+  max_objects: 25
+  train_split: train2017
+  val_split: val2017
+  train_horizontal_flip_prob: 0.5
+  # RAM caching for faster data loading
+  cache_in_ram: true      # Enable RAM caching
+  cache_train: true        # Cache training data
+  cache_val: true          # Cache validation data
+
+dino:
+  size: s
+  freeze: true
+
+slots:
+  num_iterations: 5
+  num_slots: 25
+  num_heads: 1
+  slot_size: 256
+  input_size: null  # auto from DINO feature dim
+  out_size: null    # auto from DINO feature dim
+  mlp_hidden_size: 512
+  detach_last_iteration: false
+  qk_rmsnorm: false
+  qk_rmsnorm_eps: 1.0e-6
+  rope:
+    rescale_coords: null
+    shift_coords: null
+    jitter_coords: null
+
+decoder:
+  type: mlp  # 'mlp' or 'transformer'
+  num_heads: 1
+  transformer:
+    qk_norm: true
+    depth: 2
+    mlp_hidden_dim: 512
+    pre_mlp: true
+    dropout: 0.0
+    rope: {}
+  mlp:
+    hidden_dim: 1024
+    depth: 2
+    rope: {}
+
+wandb:
+  enabled: true
+  project: slot-dino
+  entity: null
+  run_name: dinosaur_coco_mlp_25objs_nodetach
+  mode: online
+
+output:
+  dir: runs
