@@ -327,8 +327,8 @@ def merge_instance_masks_by_category(
 
 
 def build_models(cfg: Dict[str, Any], device: torch.device):
-    from src.slot_attn import MultiHeadSTEVESA  # local import to avoid heavy deps at import time
-    from src.decoders import (
+    from src.models.slot_attn import MultiHeadSTEVESA  # local import to avoid heavy deps at import time
+    from src.models.decoders import (
         SlotAutoregressiveTransformerDecoder,
         SlotJEPADecoder,
         SlotMLPDecoder,
@@ -475,10 +475,10 @@ def build_slot_jepa_components(cfg: Dict[str, Any], device: torch.device):
     Construct the DINO backbone, teacher-student slot attention wrapper, decoder,
     and masking utilities required for Slot-JEPA training.
     """
-    from src.slot_attn import MultiHeadSTEVESA
-    from src.decoders import SlotJEPADecoder
-    from src.slot_jepa import SlotJEPATeacherStudent
-    from src.slot_masks import SlotMaskGenerator
+    from src.models.slot_attn import MultiHeadSTEVESA
+    from src.models.decoders import SlotJEPADecoder
+    from src.models.slot_jepa import SlotJEPATeacherStudent
+    from src.models.slot_masks import SlotMaskGenerator
 
     dino = load_dino_model(size=cfg["dino"]["size"], device=str(device))
     dino.eval()
@@ -575,8 +575,8 @@ def build_slot_mae_components(cfg: Dict[str, Any], device: torch.device):
     Construct the DINO backbone, Slot-MAE wrapper, decoder, and masking utility
     required for Slot-Masked Autoencoder training.
     """
-    from src.slot_mae import SlotMaskedAutoencoder
-    from src.slot_masks import SlotMaskGenerator
+    from src.models.slot_mae import SlotMaskedAutoencoder
+    from src.models.slot_masks import SlotMaskGenerator
 
     dino, slot_attn, decoder, feat_dim = build_models(cfg, device)
 

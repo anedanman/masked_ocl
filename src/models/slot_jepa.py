@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from src.slot_attn import MultiHeadSTEVESA
+from src.models.slot_attn import MultiHeadSTEVESA
 
 
 @dataclass

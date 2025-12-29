@@ -8,7 +8,7 @@ from einops import rearrange
 from einops.layers.torch import Rearrange
 from torch import nn
 
-from src.dino_rope import RopePositionEmbedding
+from src.models.dino_rope import RopePositionEmbedding
 
 
 class _LinearAnnealingSchedule:

@@ -50,7 +50,7 @@ from src.utils import (
     prepare_run_dir,
     set_global_seed,
 )
-from src.mask_metrics import (
+from src.evaluation import (
     ARIMetric,
     UnsupervisedMaskIoUMetric,
     MaskCorLocMetric,

@@ -12,7 +12,7 @@ from einops.layers.torch import Rearrange
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
-from src.dino_rope import RopePositionEmbedding
+from src.models.dino_rope import RopePositionEmbedding
 
 def is_square(n: float) -> bool:
     if n < 0:

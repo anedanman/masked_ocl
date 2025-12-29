@@ -32,15 +32,11 @@ except Exception:
     torchvision = None
     _TORCHVISION_AVAILABLE = False
 
-from src.mask_metrics import (
-    ARIMetric,
-    UnsupervisedMaskIoUMetric,
-    MaskCorLocMetric,
-    AverageBestOverlapMetric,
-    BestOverlapObjectRecoveryMetric,
-    ForegroundPixelAccuracyMetric,
-    BoundaryIoUMetric,
-    SegmentationAPARMetric,
+from src.training import (
+    create_mask_metrics,
+    flatten_metric_output,
+    get_autocast_kwargs,
+    weighted_l1_loss,
 )
 from src.utils import (
     load_config,
@@ -58,41 +54,6 @@ from src.utils import (
 from train_optimized import prepare_dataloaders, maybe_compile_optimized, compute_grad_norm
 
 
-def create_mask_metrics(
-    device: torch.device,
-    ignore_overlaps: bool = True,
-    include_ap_metrics: bool = False,
-) -> Dict[str, torch.nn.Module]:
-    metrics = {
-        "ari": ARIMetric(foreground=False, ignore_overlaps=ignore_overlaps),
-        "fg_ari": ARIMetric(foreground=True, ignore_overlaps=ignore_overlaps),
-        "iou": UnsupervisedMaskIoUMetric(ignore_overlaps=ignore_overlaps),
-        "corloc": MaskCorLocMetric(ignore_overlaps=ignore_overlaps),
-        "abo": AverageBestOverlapMetric(ignore_overlaps=ignore_overlaps),
-        "obj_recovery": BestOverlapObjectRecoveryMetric(ignore_overlaps=ignore_overlaps),
-        "pixel_acc": ForegroundPixelAccuracyMetric(reduction="micro", ignore_overlaps=ignore_overlaps),
-        "mean_pixel_acc": ForegroundPixelAccuracyMetric(reduction="macro", ignore_overlaps=ignore_overlaps),
-        "boundary_iou": BoundaryIoUMetric(ignore_overlaps=ignore_overlaps),
-    }
-    if include_ap_metrics:
-        metrics["seg_ap_ar"] = SegmentationAPARMetric()
-    return {name: metric.to(device) for name, metric in metrics.items()}
-
-
-def _flatten_metric_output(value: Any) -> List[Tuple[str, float]]:
-    flat_items: List[Tuple[str, float]] = []
-    if isinstance(value, dict):
-        for sub_name, sub_val in value.items():
-            if isinstance(sub_val, torch.Tensor):
-                sub_val = sub_val.item()
-            flat_items.append((str(sub_name), float(sub_val)))
-    else:
-        if isinstance(value, torch.Tensor):
-            value = value.item()
-        flat_items.append(("", float(value)))
-    return flat_items
-
-
 def _teacher_assignments(attn_vis: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     if attn_vis.ndim != 4:
         raise ValueError(f"Expected attn_vis with ndim=4, got shape {tuple(attn_vis.shape)}")
@@ -106,44 +67,6 @@ def _apply_context_mask(features: torch.Tensor, context_mask: torch.Tensor) -> t
     flat = rearrange(features, "b c h w -> b (h w) c")
     masked = flat * context_mask.unsqueeze(-1).to(flat.dtype)
     return rearrange(masked, "b (h w) c -> b c h w", h=H, w=W)
-
-
-def _weighted_l1_loss(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    diff = torch.abs(pred - target.unsqueeze(1)).mean(dim=-1, keepdim=True)
-    loss_num = (diff * weights.unsqueeze(-1)).sum()
-    denom = weights.sum().clamp_min(eps)
-    return loss_num / denom
-
-
-def _weighted_l2_loss(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    diff2 = (pred - target.unsqueeze(1)) ** 2
-    diff2 = diff2.mean(dim=-1, keepdim=True)
-    loss_num = (diff2 * weights.unsqueeze(-1)).sum()
-    denom = weights.sum().clamp_min(eps)
-    return loss_num / denom
-
-
-def _weighted_recon_loss(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor, *, loss_type: str = "l1") -> torch.Tensor:
-    lt = str(loss_type).lower()
-    if lt in ("l1", "mae"):
-        return _weighted_l1_loss(pred, target, weights)
-    if lt in ("l2", "mse"):
-        return _weighted_l2_loss(pred, target, weights)
-    raise ValueError(f"Unsupported reconstruction loss '{loss_type}'. Use 'l1' or 'l2'.")
-
-
-def _get_autocast_kwargs(device: torch.device, train_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    enabled = train_cfg.get("amp", device.type == "cuda")
-    if not enabled:
-        return {"enabled": False, "device_type": device.type}
-    dtype_str = str(train_cfg.get("amp_dtype", "bfloat16")).lower()
-    if dtype_str == "float16" or dtype_str == "fp16":
-        dtype = torch.float16
-    elif dtype_str == "bfloat16" or dtype_str == "bf16":
-        dtype = torch.bfloat16
-    else:
-        raise ValueError(f"Unsupported amp_dtype '{dtype_str}'. Use 'float16' or 'bfloat16'.")
-    return {"enabled": True, "device_type": device.type, "dtype": dtype}
 
 
 def main():
@@ -196,7 +119,7 @@ def main():
         weight_decay=weight_decay,
     )
 
-    autocast_kwargs = _get_autocast_kwargs(device, train_cfg)
+    autocast_kwargs = get_autocast_kwargs(device, train_cfg)
 
     run = None
     use_wandb = cfg.get("wandb", {}).get("enabled", False) and _WANDB_AVAILABLE
@@ -484,7 +407,7 @@ def main():
                         preds_flat = rearrange(preds, "b s c h w -> b s (h w) c")
                         target_flat = rearrange(feats, "b c h w -> b (h w) c")
                         weights = assignments * mask_batch.target_mask.float()
-                        val_loss_value = _weighted_l1_loss(preds_flat, target_flat, weights).detach()
+                        val_loss_value = weighted_l1_loss(preds_flat, target_flat, weights).detach()
                         val_losses.append(float(val_loss_value.item()))
 
                     sa_masks = attn_to_slot_masks(teacher_attn, Hf, Wf)
@@ -552,7 +475,7 @@ def main():
                         for name, metric in metric_group.items():
                             metric_label = metric_name_map.get(name, name)
                             metric_value = metric.compute()
-                            for suffix, scalar in _flatten_metric_output(metric_value):
+                            for suffix, scalar in flatten_metric_output(metric_value):
                                 key = f"{prefix}/{metric_label}"
                                 if suffix:
                                     key = f"{key}/{suffix}"

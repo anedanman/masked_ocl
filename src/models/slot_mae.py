@@ -5,8 +5,8 @@ import torch
 from torch import nn
 from einops import rearrange
 
-from src.slot_attn import MultiHeadSTEVESA
-from src.slot_masks import SlotMaskBatch, SlotMaskGenerator
+from src.models.slot_attn import MultiHeadSTEVESA
+from src.models.slot_masks import SlotMaskBatch, SlotMaskGenerator
 
 
 @dataclass

@@ -8,6 +8,7 @@ configs/generated/*
 dinov3/
 dinov3_ckpts/
 vjepa2/
+spot/
 
 # Training logs and checkpoints 
 wandb/
