@@ -33,7 +33,8 @@ except Exception:
     _TORCHVISION_AVAILABLE = False
 
 from src.training import (
-    create_mask_metrics,
+    add_background_channel,
+    create_spot_metrics,
     flatten_metric_output,
     get_autocast_kwargs,
     weighted_l1_loss,
@@ -159,7 +160,6 @@ def main():
     data_cfg = cfg.get("data", {})
     dataset_type = data_cfg.get("dataset", "coco").lower()
     semantic_eval_enabled = dataset_type == "coco" and train_cfg.get("eval_semantic_metrics", True)
-    enable_seg_ap_ar = bool(train_cfg.get("enable_seg_ap_ar", False))
 
     eval_target_sets: List[str] = ["instance"]
     if semantic_eval_enabled:
@@ -168,21 +168,17 @@ def main():
     metrics_device = device
     metrics_val = {}
     for target in eval_target_sets:
-        include_ap = enable_seg_ap_ar and target == "semantic"
         metrics_val[target] = {
-            "sa": create_mask_metrics(metrics_device, include_ap_metrics=include_ap),
-            "dec": create_mask_metrics(metrics_device, include_ap_metrics=include_ap),
+            "sa": create_spot_metrics(metrics_device, target),
+            "dec": create_spot_metrics(metrics_device, target),
         }
     metric_name_map = {
-        "ari": "ari",
+        "mBO_i": "mBO_i",
+        "mBO_c": "mBO_c",
+        "mIoU": "mIoU",
         "fg_ari": "fg_ari",
-        "iou": "unsupervised_miou",
+        "ari": "ari",
         "corloc": "corloc",
-        "abo": "average_best_overlap",
-        "obj_recovery": "best_overlap_object_recovery",
-        "pixel_acc": "pixel_accuracy",
-        "mean_pixel_acc": "mean_pixel_accuracy",
-        "boundary_iou": "boundary_iou",
     }
 
     if resume_latest and resume_path is None:
@@ -348,9 +344,13 @@ def main():
                     dec_masks = attn_masks
                 dec_masks_img = F.interpolate(dec_masks, size=images.shape[-2:], mode="nearest")
 
+                if gt_masks is not None:
+                    gt_for_viz = add_background_channel(gt_masks[:1])[0].detach().cpu()
+                else:
+                    gt_for_viz = attn_masks_img[0].detach().cpu()
                 grid = make_visual_grid(
                     images[0].detach().cpu(),
-                    gt_masks[0].detach().cpu() if gt_masks is not None else attn_masks_img[0].detach().cpu(),
+                    gt_for_viz,
                     attn_masks_img[0].detach().cpu(),
                     dec_masks_img[0].detach().cpu(),
                     visible_mask=primary_visible_img[0].detach().cpu(),
@@ -486,6 +486,14 @@ def main():
                     target_sets_det = {
                         name: masks.detach() for name, masks in target_sets.items()
                     }
+                    target_sets_metric = {
+                        name: add_background_channel(masks) for name, masks in target_sets_det.items()
+                    }
+                    ignore_mask = batch.get("ignore_mask", None)
+                    if ignore_mask is not None:
+                        ignore_mask = ignore_mask.to(device, non_blocking=True)
+                        if ignore_mask.ndim == 3:
+                            ignore_mask = ignore_mask.unsqueeze(1)
 
                     dec_metrics_img_det = None
                     viz_dec_masks_img_det = None
@@ -500,13 +508,13 @@ def main():
                         )
                         viz_dec_masks_img_det = viz_dec_masks_img.detach()
 
-                    for target_name, target_gt in target_sets_det.items():
+                    for target_name, target_gt in target_sets_metric.items():
                         metric_bucket = metrics_val[target_name]
                         for metric in metric_bucket["sa"].values():
-                            metric.update(attn_masks_img_det, target_gt)
+                            metric.update(attn_masks_img_det, target_gt, ignore_mask)
                         if dec_metrics_img_det is not None:
                             for metric in metric_bucket["dec"].values():
-                                metric.update(dec_metrics_img_det, target_gt)
+                                metric.update(dec_metrics_img_det, target_gt, ignore_mask)
                             dec_metrics_updated = True
                         target_metrics_active[target_name] = True
 
@@ -520,9 +528,12 @@ def main():
                         else:
                             viz_dec_masks = attn_masks_img_cpu
                         for i in range(take):
+                            gt_for_viz = add_background_channel(
+                                gt_masks_cpu[i].unsqueeze(0)
+                            )[0]
                             grid = make_visual_grid(
                                 images[i].detach().cpu(),
-                                gt_masks_cpu[i],
+                                gt_for_viz,
                                 attn_masks_img_cpu[i],
                                 viz_dec_masks[i],
                                 visible_mask=primary_visible_img_cpu[i],
@@ -553,6 +564,7 @@ def main():
                             metric_label = metric_name_map.get(name, name)
                             metric_value = metric.compute()
                             for suffix, scalar in flatten_metric_output(metric_value):
+                                scalar *= 100.0
                                 key = f"{sa_prefix}/{metric_label}"
                                 if suffix:
                                     key = f"{key}/{suffix}"
@@ -564,6 +576,7 @@ def main():
                                 metric_label = metric_name_map.get(name, name)
                                 metric_value = metric.compute()
                                 for suffix, scalar in flatten_metric_output(metric_value):
+                                    scalar *= 100.0
                                     key = f"{dec_prefix}/{metric_label}"
                                     if suffix:
                                         key = f"{key}/{suffix}"

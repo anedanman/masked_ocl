@@ -33,7 +33,8 @@ except Exception:
     _TORCHVISION_AVAILABLE = False
 
 from src.training import (
-    create_mask_metrics,
+    add_background_channel,
+    create_spot_metrics,
     flatten_metric_output,
     get_autocast_kwargs,
     weighted_l1_loss,
@@ -158,7 +159,6 @@ def main():
     data_cfg = cfg.get("data", {})
     dataset_type = data_cfg.get("dataset", "coco").lower()
     semantic_eval_enabled = dataset_type == "coco" and train_cfg.get("eval_semantic_metrics", True)
-    enable_seg_ap_ar = bool(train_cfg.get("enable_seg_ap_ar", False))
 
     eval_target_sets: List[str] = ["instance"]
     if semantic_eval_enabled:
@@ -166,22 +166,15 @@ def main():
 
     metrics_device = device
     metrics_val = {
-        target: create_mask_metrics(
-            metrics_device,
-            include_ap_metrics=(enable_seg_ap_ar and target == "semantic"),
-        )
-        for target in eval_target_sets
+        target: create_spot_metrics(metrics_device, target) for target in eval_target_sets
     }
     metric_name_map = {
-        "ari": "ari",
+        "mBO_i": "mBO_i",
+        "mBO_c": "mBO_c",
+        "mIoU": "mIoU",
         "fg_ari": "fg_ari",
-        "iou": "unsupervised_miou",
+        "ari": "ari",
         "corloc": "corloc",
-        "abo": "average_best_overlap",
-        "obj_recovery": "best_overlap_object_recovery",
-        "pixel_acc": "pixel_accuracy",
-        "mean_pixel_acc": "mean_pixel_accuracy",
-        "boundary_iou": "boundary_iou",
     }
 
     if resume_latest and resume_path is None:
@@ -431,11 +424,19 @@ def main():
                     target_sets_det = {
                         name: masks.detach() for name, masks in target_sets.items()
                     }
+                    target_sets_metric = {
+                        name: add_background_channel(masks) for name, masks in target_sets_det.items()
+                    }
+                    ignore_mask = batch.get("ignore_mask", None)
+                    if ignore_mask is not None:
+                        ignore_mask = ignore_mask.to(device, non_blocking=True)
+                        if ignore_mask.ndim == 3:
+                            ignore_mask = ignore_mask.unsqueeze(1)
 
-                    for target_name, target_gt in target_sets_det.items():
+                    for target_name, target_gt in target_sets_metric.items():
                         metric_bucket = metrics_val[target_name]
                         for metric in metric_bucket.values():
-                            metric.update(sa_masks_img_det, target_gt)
+                            metric.update(sa_masks_img_det, target_gt, ignore_mask)
                         target_metrics_active[target_name] = True
 
                     if use_wandb and viz_target > 0 and len(viz_grids) < viz_target:
@@ -476,6 +477,7 @@ def main():
                             metric_label = metric_name_map.get(name, name)
                             metric_value = metric.compute()
                             for suffix, scalar in flatten_metric_output(metric_value):
+                                scalar *= 100.0
                                 key = f"{prefix}/{metric_label}"
                                 if suffix:
                                     key = f"{key}/{suffix}"

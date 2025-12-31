@@ -10,7 +10,7 @@ from src.evaluation.mask_metrics import (
     SegmentationAPARMetric,
     UnsupervisedMaskIoUMetric,
 )
-from src.evaluation.crf import dense_crf, crf_refine, crf_refine_batch
+# from src.evaluation.crf import dense_crf, crf_refine, crf_refine_batch
 
 __all__ = [
     "ARIMetric",
@@ -21,7 +21,7 @@ __all__ = [
     "MaskCorLocMetric",
     "SegmentationAPARMetric",
     "UnsupervisedMaskIoUMetric",
-    "dense_crf",
-    "crf_refine",
-    "crf_refine_batch",
+    # "dense_crf",
+    # "crf_refine",
+    # "crf_refine_batch",
 ]

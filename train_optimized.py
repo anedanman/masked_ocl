@@ -50,16 +50,7 @@ from src.utils import (
     prepare_run_dir,
     set_global_seed,
 )
-from src.evaluation import (
-    ARIMetric,
-    UnsupervisedMaskIoUMetric,
-    MaskCorLocMetric,
-    AverageBestOverlapMetric,
-    BestOverlapObjectRecoveryMetric,
-    BoundaryIoUMetric,
-    SegmentationAPARMetric,
-    ForegroundPixelAccuracyMetric,
-)
+from src.training import add_background_channel, create_spot_metrics
 
 
 def compute_grad_norm(parameters, norm_type: float = 2.0) -> torch.Tensor:
@@ -78,27 +69,6 @@ def compute_grad_norm(parameters, norm_type: float = 2.0) -> torch.Tensor:
         return torch.tensor(0.0, device=device)
     flat = torch.cat(grads)
     return torch.linalg.vector_norm(flat, ord=norm_type)
-
-
-def create_mask_metrics(
-    device: torch.device,
-    ignore_overlaps: bool = True,
-    include_ap_metrics: bool = False,
-):
-    metrics = {
-        "ari": ARIMetric(foreground=False, ignore_overlaps=ignore_overlaps),
-        "fg_ari": ARIMetric(foreground=True, ignore_overlaps=ignore_overlaps),
-        "iou": UnsupervisedMaskIoUMetric(ignore_overlaps=ignore_overlaps),
-        "corloc": MaskCorLocMetric(ignore_overlaps=ignore_overlaps),
-        "abo": AverageBestOverlapMetric(ignore_overlaps=ignore_overlaps),
-        "obj_recovery": BestOverlapObjectRecoveryMetric(ignore_overlaps=ignore_overlaps),
-        "pixel_acc": ForegroundPixelAccuracyMetric(reduction="micro", ignore_overlaps=ignore_overlaps),
-        "mean_pixel_acc": ForegroundPixelAccuracyMetric(reduction="macro", ignore_overlaps=ignore_overlaps),
-        "boundary_iou": BoundaryIoUMetric(ignore_overlaps=ignore_overlaps),
-    }
-    if include_ap_metrics:
-        metrics["seg_ap_ar"] = SegmentationAPARMetric()
-    return {name: metric.to(device) for name, metric in metrics.items()}
 
 
 def _flatten_metric_output(value: Any) -> List[Tuple[str, float]]:
@@ -307,7 +277,6 @@ def main():
     dataset_type = data_cfg.get("dataset", "coco").lower()
     train_cfg = cfg["train"]
     semantic_eval_enabled = dataset_type == "coco" and train_cfg.get("eval_semantic_metrics", True)
-    enable_seg_ap_ar = bool(train_cfg.get("enable_seg_ap_ar", False))
 
     eval_target_sets: List[str] = ["instance"]
     if semantic_eval_enabled:
@@ -317,21 +286,17 @@ def main():
     metrics_device = device
     metrics_val = {}
     for target in eval_target_sets:
-        include_ap = enable_seg_ap_ar and target == "semantic"
         metrics_val[target] = {
-            "sa": create_mask_metrics(metrics_device, include_ap_metrics=include_ap),
-            "dec": create_mask_metrics(metrics_device, include_ap_metrics=include_ap),
+            "sa": create_spot_metrics(metrics_device, target),
+            "dec": create_spot_metrics(metrics_device, target),
         }
     metric_name_map = {
-        "ari": "ari",
+        "mBO_i": "mBO_i",
+        "mBO_c": "mBO_c",
+        "mIoU": "mIoU",
         "fg_ari": "fg_ari",
-        "iou": "unsupervised_miou",
+        "ari": "ari",
         "corloc": "corloc",
-        "abo": "average_best_overlap",
-        "obj_recovery": "best_overlap_object_recovery",
-        "pixel_acc": "pixel_accuracy",
-        "mean_pixel_acc": "mean_pixel_accuracy",
-        "boundary_iou": "boundary_iou",
     }
 
     # Optional resume
@@ -546,14 +511,22 @@ def main():
                     target_sets_det = {
                         name: masks.detach() for name, masks in target_sets.items()
                     }
+                    target_sets_metric = {
+                        name: add_background_channel(masks) for name, masks in target_sets_det.items()
+                    }
+                    ignore_mask = batch.get("ignore_mask", None)
+                    if ignore_mask is not None:
+                        ignore_mask = ignore_mask.to(device, non_blocking=True)
+                        if ignore_mask.ndim == 3:
+                            ignore_mask = ignore_mask.unsqueeze(1)
 
                     # Update metrics
-                    for target_name, target_gt in target_sets_det.items():
+                    for target_name, target_gt in target_sets_metric.items():
                         metric_bucket = metrics_val[target_name]
                         for metric in metric_bucket["sa"].values():
-                            metric.update(sa_masks_img_det, target_gt)
+                            metric.update(sa_masks_img_det, target_gt, ignore_mask)
                         for metric in metric_bucket["dec"].values():
-                            metric.update(dec_masks_img_det, target_gt)
+                            metric.update(dec_masks_img_det, target_gt, ignore_mask)
                         target_metrics_active[target_name] = True
                         dec_metrics_updated = True
 
@@ -589,6 +562,7 @@ def main():
                         metric_label = metric_name_map.get(name, name)
                         metric_value = metric.compute()
                         for suffix, scalar in _flatten_metric_output(metric_value):
+                            scalar *= 100.0
                             key = f"{sa_prefix}/{metric_label}"
                             if suffix:
                                 key = f"{key}/{suffix}"
@@ -602,6 +576,7 @@ def main():
                             metric_label = metric_name_map.get(name, name)
                             metric_value = metric.compute()
                             for suffix, scalar in _flatten_metric_output(metric_value):
+                                scalar *= 100.0
                                 key = f"{dec_prefix}/{metric_label}"
                                 if suffix:
                                     key = f"{key}/{suffix}"

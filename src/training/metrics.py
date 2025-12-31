@@ -12,6 +12,48 @@ from src.evaluation.mask_metrics import (
 )
 
 
+def add_background_channel(masks: torch.Tensor) -> torch.Tensor:
+    """Prepend a background channel for one-hot style metric targets."""
+    if masks.ndim != 4:
+        raise ValueError(f"Expected masks with shape (B, K, H, W). Got {masks.shape}.")
+    bg = (masks.sum(dim=1, keepdim=True) == 0).to(masks.dtype)
+    return torch.cat([bg, masks], dim=1)
+
+
+def create_spot_metrics(
+    device: torch.device,
+    target: Literal["instance", "semantic"],
+    ignore_overlaps: bool = True,
+) -> Dict[str, torch.nn.Module]:
+    """Create SPOT-aligned metrics for a specific target type."""
+    if target == "instance":
+        metrics = {
+            "mBO_i": AverageBestOverlapMetric(
+                ignore_background=True, ignore_overlaps=ignore_overlaps
+            ),
+            "mIoU": UnsupervisedMaskIoUMetric(
+                matching="hungarian",
+                ignore_background=True,
+                ignore_overlaps=ignore_overlaps,
+            ),
+            "fg_ari": ARIMetric(foreground=True, ignore_overlaps=ignore_overlaps),
+            "ari": ARIMetric(foreground=False, ignore_overlaps=ignore_overlaps),
+            "corloc": MaskCorLocMetric(
+                ignore_background=True, ignore_overlaps=ignore_overlaps
+            ),
+        }
+    elif target == "semantic":
+        metrics = {
+            "mBO_c": AverageBestOverlapMetric(
+                ignore_background=True, ignore_overlaps=ignore_overlaps
+            ),
+        }
+    else:
+        raise ValueError(f"Unknown target '{target}'. Expected 'instance' or 'semantic'.")
+
+    return {name: metric.to(device) for name, metric in metrics.items()}
+
+
 def create_mask_metrics(
     device: torch.device,
     ignore_overlaps: bool = True,

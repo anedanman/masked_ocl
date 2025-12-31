@@ -317,12 +317,24 @@ class CLEVRTEXDataset(Dataset):
 
 class COCODataset(Dataset):
     """
-    COCO dataset wrapper that leverages panoptic annotations to produce either instance masks
-    (one mask per segment) or class masks (one mask per semantic class).
+    COCO dataset wrapper that uses instance segmentation annotations (like COCO2017 from SPOT).
+
+    Uses pycocotools to decode RLE masks from instance annotations, matching the behavior
+    of the SPOT evaluation dataset.
 
     The ``max_objects`` argument filters out images that contain more than the requested number
     of instances / classes but does not truncate the returned masks.
     """
+
+    # Same 81 categories as COCO2017 in spot/datasets.py
+    NUM_CLASSES = 81
+    CAT_LIST = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19,
+        20, 21, 22, 23, 24, 25, 27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+        43, 44, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+        64, 65, 67, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88,
+        89, 90
+    ]
 
     def __init__(
         self,
@@ -341,6 +353,10 @@ class COCODataset(Dataset):
         super().__init__()
         if mode not in {"instance", "class"}:
             raise ValueError(f"Unsupported mode '{mode}'. Expected 'instance' or 'class'.")
+
+        # Import pycocotools here to match COCO2017 behavior
+        from pycocotools.coco import COCO
+        from pycocotools import mask as coco_mask_utils
 
         self.data_root = data_root
         self.split = split
@@ -361,72 +377,46 @@ class COCODataset(Dataset):
 
         self.transform = make_transform(resize_size=image_size)
 
-        panoptic_ann_path = os.path.join(data_root, "annotations", f"panoptic_{split}.json")
-        if not os.path.exists(panoptic_ann_path):
-            raise FileNotFoundError(f"Panoptic annotations not found at {panoptic_ann_path}")
+        # Use instance annotations (like COCO2017)
+        ann_file = os.path.join(data_root, "annotations", f"instances_{split}.json")
+        if not os.path.exists(ann_file):
+            raise FileNotFoundError(f"Instance annotations not found at {ann_file}")
 
-        with open(panoptic_ann_path, "r") as f:
-            panoptic_data = json.load(f)
-
+        # Find image directory
         self.image_dir = os.path.join(data_root, split)
-        self.segmentation_root = os.path.join(data_root, "annotations", f"panoptic_{split}")
+        if not os.path.isdir(self.image_dir):
+            self.image_dir = os.path.join(data_root, "images", split)
+            if not os.path.isdir(self.image_dir):
+                raise FileNotFoundError(f"Image directory not found at {self.image_dir}")
 
-        self.categories = {cat["id"]: cat for cat in panoptic_data["categories"]}
-        self.num_categories = len(self.categories)
-        self.category_id_to_idx = {
-            cat_id: idx for idx, cat_id in enumerate(sorted(self.categories.keys()))
-        }
+        # Load COCO annotations
+        self.coco = COCO(ann_file)
+        self.coco_mask_utils = coco_mask_utils
+
+        # Use the same category mapping as COCO2017
+        self.num_categories = self.NUM_CLASSES
+        self.category_id_to_idx = {cat_id: idx for idx, cat_id in enumerate(self.CAT_LIST)}
         self.idx_to_category_id = {idx: cat_id for cat_id, idx in self.category_id_to_idx.items()}
         self.property_dim = self.num_categories + 3  # category one-hot + center_x + center_y + presence
 
-        image_id_to_info = {img["id"]: img for img in panoptic_data["images"]}
-
-        samples: List[Dict[str, Any]] = []
-        filtered_out = 0
-        for ann in panoptic_data["annotations"]:
-            image_info = image_id_to_info.get(ann["image_id"])
-            if image_info is None:
-                continue
-
-            segments = [seg for seg in ann["segments_info"] if seg.get("iscrowd", 0) == 0]
-
-            if self.min_area > 0:
-                segments = [seg for seg in segments if seg.get("area", 0.0) >= self.min_area]
-            if not segments:
-                continue
-
-            if mode == "instance":
-                object_count = len(segments)
-            else:
-                object_count = len({seg["category_id"] for seg in segments})
-
-            if self.max_objects is not None and object_count > self.max_objects:
-                filtered_out += 1
-                continue
-
-            samples.append(
-                {
-                    "image_id": ann["image_id"],
-                    "image_file": image_info["file_name"],
-                    "width": image_info["width"],
-                    "height": image_info["height"],
-                    "segments_info": segments,
-                    "segmentation_file": ann["file_name"],
-                }
-            )
+        # Get all image IDs
+        self.image_ids = list(self.coco.imgs.keys())
 
         if max_samples is not None:
-            samples = samples[:max_samples]
+            self.image_ids = self.image_ids[:max_samples]
 
-        if not samples:
-            raise RuntimeError(
-                "COCODataset: no samples remain after applying filters. "
-                "Consider increasing max_objects or relaxing min_area."
-            )
+        # Build samples list
+        self.samples = []
+        for img_id in self.image_ids:
+            img_info = self.coco.loadImgs(img_id)[0]
+            self.samples.append({
+                "image_id": img_id,
+                "image_file": img_info["file_name"],
+                "width": img_info["width"],
+                "height": img_info["height"],
+            })
 
-        self.samples = samples
-        self.image_ids = [sample["image_id"] for sample in samples]
-        self.filtered_out = filtered_out
+        self.filtered_out = 0
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -438,82 +428,66 @@ class COCODataset(Dataset):
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
         return self.transform(img)
 
-    def _load_panoptic_map(self, sample: Dict[str, Any], horizontal_flip: bool = False) -> np.ndarray:
-        seg_path = os.path.join(self.segmentation_root, sample["segmentation_file"])
-        seg_img = Image.open(seg_path)
-        seg_np = np.array(seg_img, dtype=np.uint32)
-        if seg_np.ndim == 3:
-            seg_map = (
-                seg_np[:, :, 0]
-                + (seg_np[:, :, 1] << 8)
-                + (seg_np[:, :, 2] << 16)
-            )
-        else:
-            seg_map = seg_np
-        if horizontal_flip:
-            seg_map = np.fliplr(seg_map)
-        return seg_map
-
     def _resize_mask(self, mask: np.ndarray) -> torch.Tensor:
         mask_img = Image.fromarray(mask.astype(np.uint8) * 255)
         mask_img = mask_img.resize((self.image_size, self.image_size), Image.NEAREST)
         mask_resized = np.array(mask_img, dtype=np.uint8) > 0
         return torch.from_numpy(mask_resized.astype(np.float32))
 
+    def _gen_seg_n_insta_masks(self, annotations, h, w):
+        seg_mask = np.zeros((h, w), dtype=np.uint8)
+        insta_mask = np.zeros((h, w), dtype=np.uint8)
+        overlap_count = np.zeros((h, w), dtype=np.uint8)
+        category_ids = []
+
+        inst_id = 0
+        for ann in annotations:
+            cat = ann["category_id"]
+            if cat not in self.category_id_to_idx:
+                continue
+
+            # Robust decoding for polygons + RLE + crowd
+            m = self.coco.annToMask(ann).astype(np.uint8)  # (h, w) in {0,1}
+            if m.sum() == 0:
+                continue
+
+            inst_id += 1
+            category_ids.append(cat)
+
+            c = self.category_id_to_idx[cat]  # O(1), don’t use CAT_LIST.index()
+
+            # fill only where empty (first-come-first-served)
+            fill = (m == 1) & (seg_mask == 0)
+            seg_mask[fill] = c
+
+            fill_i = (m == 1) & (insta_mask == 0)
+            insta_mask[fill_i] = inst_id
+
+            overlap_count += m
+
+        ignore_mask = (overlap_count > 1).astype(np.uint8)
+        return seg_mask, insta_mask, ignore_mask, category_ids
+
     def _build_instance_masks(
-        self, seg_map: np.ndarray, segments: List[Dict[str, Any]]
+        self, insta_mask: np.ndarray, seg_mask: np.ndarray, category_ids: List[int]
     ) -> Tuple[List[torch.Tensor], List[int], List[Dict[str, Any]]]:
+        """Build per-instance mask tensors from the combined instance mask."""
         masks: List[torch.Tensor] = []
         categories: List[int] = []
         metadata: List[Dict[str, Any]] = []
 
-        for seg in sorted(segments, key=lambda x: x.get("area", 0), reverse=True):
-            mask_bool = (seg_map == seg["id"])
+        for i, cat_id in enumerate(category_ids, 1):
+            mask_bool = (insta_mask == i)
             if not mask_bool.any():
                 continue
-            masks.append(self._resize_mask(mask_bool))
-            categories.append(seg["category_id"])
-            metadata.append(
-                {
-                    "mask": mask_bool.copy(),
-                    "category_id": seg["category_id"],
-                    "bbox": seg.get("bbox"),
-                    "area": float(seg.get("area", mask_bool.sum())),
-                }
-            )
-        return masks, categories, metadata
-
-    def _build_class_masks(
-        self, seg_map: np.ndarray, segments: List[Dict[str, Any]]
-    ) -> Tuple[List[torch.Tensor], List[int], List[Dict[str, Any]]]:
-        class_masks: Dict[int, np.ndarray] = {}
-
-        for seg in segments:
-            mask_bool = (seg_map == seg["id"])
-            if not mask_bool.any():
-                continue
-            cat_id = seg["category_id"]
-            if cat_id in class_masks:
-                class_masks[cat_id] = np.logical_or(class_masks[cat_id], mask_bool)
-            else:
-                class_masks[cat_id] = mask_bool.copy()
-
-        masks: List[torch.Tensor] = []
-        categories: List[int] = []
-        metadata: List[Dict[str, Any]] = []
-
-        for cat_id in sorted(class_masks.keys()):
-            mask_bool = class_masks[cat_id]
             masks.append(self._resize_mask(mask_bool))
             categories.append(cat_id)
-            metadata.append(
-                {
-                    "mask": mask_bool.copy(),
-                    "category_id": cat_id,
-                    "bbox": None,  # populated later from the merged mask
-                    "area": float(mask_bool.sum()),
-                }
-            )
+            metadata.append({
+                "mask": mask_bool.copy(),
+                "category_id": cat_id,
+                "bbox": None,
+                "area": float(mask_bool.sum()),
+            })
 
         return masks, categories, metadata
 
@@ -544,8 +518,9 @@ class COCODataset(Dataset):
 
         orig_h, orig_w = original_size
         for idx, cat_id in enumerate(categories):
-            cat_idx = self.category_id_to_idx[cat_id]
-            properties[idx, cat_idx] = 1.0
+            if cat_id in self.category_id_to_idx:
+                cat_idx = self.category_id_to_idx[cat_id]
+                properties[idx, cat_idx] = 1.0
 
             mask_bool = metadata[idx]["mask"]
             ys, xs = np.nonzero(mask_bool)
@@ -579,23 +554,30 @@ class COCODataset(Dataset):
         if not self.return_masks:
             return output
 
-        seg_map = self._load_panoptic_map(sample, horizontal_flip=do_hflip)
+        # Load annotations using pycocotools (like COCO2017)
+        img_id = sample["image_id"]
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        annotations = self.coco.loadAnns(ann_ids)
 
-        if self.mode == "instance":
-            masks_list, category_ids, metadata = self._build_instance_masks(
-                seg_map, sample["segments_info"]
-            )
-        else:
-            masks_list, category_ids, metadata = self._build_class_masks(
-                seg_map, sample["segments_info"]
-            )
+        h, w = sample["height"], sample["width"]
+
+        # Generate masks using the same logic as COCO2017
+        seg_mask, insta_mask, ignore_mask, raw_category_ids = self._gen_seg_n_insta_masks(
+            annotations, h, w
+        )
+
+        # Apply horizontal flip if needed
         if do_hflip:
-            for meta in metadata:
-                meta["bbox"] = None
+            seg_mask = np.fliplr(seg_mask).copy()
+            insta_mask = np.fliplr(insta_mask).copy()
+            ignore_mask = np.fliplr(ignore_mask).copy()
+
+        # Build per-instance masks
+        masks_list, category_ids, metadata = self._build_instance_masks(
+            insta_mask, seg_mask, raw_category_ids
+        )
 
         num_instances = len(category_ids)
-        if self.max_objects is not None and num_instances > self.max_objects:
-            raise RuntimeError("Encountered sample exceeding max_objects after filtering.")
 
         if self.max_objects is not None:
             mask_tensor = torch.zeros(
@@ -603,6 +585,8 @@ class COCODataset(Dataset):
             )
             category_tensor = torch.full((self.max_objects,), -1, dtype=torch.long)
             for i, mask in enumerate(masks_list):
+                if i >= self.max_objects:
+                    break
                 mask_tensor[i] = mask
                 category_tensor[i] = category_ids[i]
         else:
@@ -624,6 +608,8 @@ class COCODataset(Dataset):
                 "num_instances": torch.tensor(num_instances, dtype=torch.long),
             }
         )
+        ignore_mask_tensor = self._resize_mask(ignore_mask > 0)
+        output["ignore_mask"] = ignore_mask_tensor.unsqueeze(0)
 
         if self.return_properties:
             props = self._build_properties(
@@ -640,25 +626,18 @@ class COCODataset(Dataset):
             bboxes_tensor = torch.zeros(num_instances, 4, dtype=torch.float32)
 
         orig_area = max(sample["width"] * sample["height"], 1)
-        for i in range(num_instances):
+        for i in range(min(num_instances, len(metadata))):
             meta = metadata[i]
             area_px = float(meta.get("area", 0.0))
             areas_tensor[i] = area_px / orig_area
 
-            bbox = meta.get("bbox")
-            if bbox is not None:
-                x = bbox[0] / max(sample["width"], 1)
-                y = bbox[1] / max(sample["height"], 1)
-                w = bbox[2] / max(sample["width"], 1)
-                h = bbox[3] / max(sample["height"], 1)
-            else:
-                x, y, w, h = self._bbox_from_mask(
-                    meta["mask"], sample["width"], sample["height"]
-                )
+            x, y, bw, bh = self._bbox_from_mask(
+                meta["mask"], sample["width"], sample["height"]
+            )
             bboxes_tensor[i, 0] = x
             bboxes_tensor[i, 1] = y
-            bboxes_tensor[i, 2] = w
-            bboxes_tensor[i, 3] = h
+            bboxes_tensor[i, 2] = bw
+            bboxes_tensor[i, 3] = bh
 
         output["areas"] = areas_tensor
         output["bboxes"] = bboxes_tensor
