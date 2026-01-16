@@ -14,6 +14,7 @@ class SlotJEPAOutput:
     teacher_attn: torch.Tensor
     student_slots: torch.Tensor
     student_attn: torch.Tensor
+    init_loss: Optional[torch.Tensor] = None
 
 
 class SlotJEPATeacherStudent(nn.Module):
@@ -101,6 +102,7 @@ class SlotJEPATeacherStudent(nn.Module):
         slot_noise: Optional[torch.Tensor] = None,
         teacher_iterations: Optional[int] = None,
         student_iterations: Optional[int] = None,
+        cls_token: Optional[torch.Tensor] = None,
     ) -> SlotJEPAOutput:
         """
         Args:
@@ -129,19 +131,21 @@ class SlotJEPATeacherStudent(nn.Module):
                 )
 
         with torch.no_grad():
-            teacher_slots, teacher_attn = self.teacher.forward_slots(
+            teacher_slots, teacher_attn, _ = self.teacher.forward_slots(
                 teacher_inputs,
                 slot_noise=slot_noise,
                 num_iterations=teacher_iterations,
+                cls_token=cls_token,
             )
 
-        student_slots, student_attn = self.student.forward_slots(
+        student_slots, student_attn, init_loss = self.student.forward_slots(
             student_inputs,
             slot_noise=slot_noise,
             attn_override=teacher_attn.detach(),
             valid_token_mask=valid_token_mask,
             guided_grad_substitute=self.guided_grad_substitute,
             num_iterations=student_iterations,
+            cls_token=cls_token,
         )
 
         return SlotJEPAOutput(
@@ -149,4 +153,5 @@ class SlotJEPATeacherStudent(nn.Module):
             teacher_attn=teacher_attn.detach(),
             student_slots=student_slots,
             student_attn=student_attn,
+            init_loss=init_loss,
         )

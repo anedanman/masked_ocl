@@ -24,6 +24,8 @@ class SlotMAEOutput:
         context_features: Feature tensor after applying the context mask.
         reconstruction_slots: Slots inferred from masked inputs used for decoding.
         reconstruction_attn: Attention maps from the masked forward pass.
+        init_loss: Optional loss for gaussian_pred mode (cosine distance between
+            initial and final slots). None if not using gaussian_pred.
     """
 
     initial_slots: torch.Tensor
@@ -33,6 +35,7 @@ class SlotMAEOutput:
     context_features: torch.Tensor
     reconstruction_slots: torch.Tensor
     reconstruction_attn: torch.Tensor
+    init_loss: Optional[torch.Tensor] = None
 
 
 class SlotMaskedAutoencoder(nn.Module):
@@ -97,6 +100,7 @@ class SlotMaskedAutoencoder(nn.Module):
         step: Optional[int] = None,
         slot_noise: Optional[torch.Tensor] = None,
         num_iterations: Optional[int] = None,
+        cls_token: Optional[torch.Tensor] = None,
     ) -> SlotMAEOutput:
         if features.ndim != 4:
             raise ValueError(f"features must have shape [B, C, H, W]; received {tuple(features.shape)}")
@@ -112,23 +116,25 @@ class SlotMaskedAutoencoder(nn.Module):
             if slot_noise.shape != expected_shape:
                 raise ValueError(f"slot_noise must have shape {expected_shape}; got {tuple(slot_noise.shape)}")
 
-        initial_slots, initial_attn = self.slot_attention.forward_slots(
+        initial_slots, initial_attn, init_loss = self.slot_attention.forward_slots(
             features,
             slot_noise=slot_noise,
             num_iterations=num_iterations,
+            cls_token=cls_token,
         )
 
         assignments = self._attn_to_assignments(initial_attn, self.eps)
         mask_batch = self.mask_generator(assignments.detach(), step=step)
         context_features = self._apply_context_mask(features, mask_batch.context_mask)
 
-        masked_slots, masked_attn = self.slot_attention.forward_slots(
+        masked_slots, masked_attn, _ = self.slot_attention.forward_slots(
             context_features,
             slot_noise=slot_noise,
             attn_override=initial_attn.detach(),
             valid_token_mask=mask_batch.context_mask,
             guided_grad_substitute=self.guided_grad_substitute,
             num_iterations=1,
+            cls_token=cls_token,
         )
 
         return SlotMAEOutput(
@@ -139,4 +145,5 @@ class SlotMaskedAutoencoder(nn.Module):
             context_features=context_features,
             reconstruction_slots=masked_slots,
             reconstruction_attn=masked_attn,
+            init_loss=init_loss,
         )

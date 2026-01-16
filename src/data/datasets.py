@@ -7,25 +7,38 @@ from PIL import Image
 from typing import Tuple, Dict, List, Optional, Union, Any
 import torchvision
 from torchvision.transforms import v2
+import torchvision.transforms.functional as TF
 
 
-def make_transform(resize_size: int = 256):
+def make_transform(resize_size: int = 256, crop: bool = False):
     """Create image transform pipeline using torchvision v2.
     
     Args:
-        resize_size: Target size for image resizing (square).
+        resize_size: Target size for image resizing.
+        crop: If True, resize smaller edge to resize_size and center crop.
+              If False, resize (squash) to (resize_size, resize_size).
         
     Returns:
         Composed transform pipeline.
     """
     to_tensor = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
+    if crop:
+        # Match SPOT behavior: Resize smaller edge -> CenterCrop
+        resize = v2.Resize(resize_size, antialias=True)
+        crop_op = v2.CenterCrop(resize_size)
+        transforms_list = [to_tensor, resize, crop_op]
+    else:
+        # Original behavior: Squash to square
+        resize = v2.Resize((resize_size, resize_size), antialias=True)
+        transforms_list = [to_tensor, resize]
+
     to_float = v2.ToDtype(torch.float32, scale=True)
     normalize = v2.Normalize(
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
     )
-    return v2.Compose([to_tensor, resize, to_float, normalize])
+    transforms_list.extend([to_float, normalize])
+    return v2.Compose(transforms_list)
 
 
 class CLEVRTEXDataset(Dataset):
@@ -375,7 +388,8 @@ class COCODataset(Dataset):
                 f"horizontal_flip_prob must be between 0 and 1 (got {horizontal_flip_prob})."
             )
 
-        self.transform = make_transform(resize_size=image_size)
+        # Use crop=True to match SPOT behavior (Resize smaller edge + CenterCrop)
+        self.transform = make_transform(resize_size=image_size, crop=True)
 
         # Use instance annotations (like COCO2017)
         ann_file = os.path.join(data_root, "annotations", f"instances_{split}.json")
@@ -429,8 +443,10 @@ class COCODataset(Dataset):
         return self.transform(img)
 
     def _resize_mask(self, mask: np.ndarray) -> torch.Tensor:
+        # Match SPOT behavior: Resize smaller edge -> CenterCrop
         mask_img = Image.fromarray(mask.astype(np.uint8) * 255)
-        mask_img = mask_img.resize((self.image_size, self.image_size), Image.NEAREST)
+        mask_img = TF.resize(mask_img, self.image_size, interpolation=torchvision.transforms.InterpolationMode.NEAREST)
+        mask_img = TF.center_crop(mask_img, self.image_size)
         mask_resized = np.array(mask_img, dtype=np.uint8) > 0
         return torch.from_numpy(mask_resized.astype(np.float32))
 
@@ -509,20 +525,20 @@ class COCODataset(Dataset):
     def _build_properties(
         self,
         categories: List[int],
-        metadata: List[Dict[str, Any]],
-        original_size: Tuple[int, int],
+        masks: List[torch.Tensor],
+        size: int,
     ) -> torch.Tensor:
         num_instances = len(categories)
         rows = self.max_objects if self.max_objects is not None else num_instances
         properties = torch.zeros(rows, self.property_dim, dtype=torch.float32)
 
-        orig_h, orig_w = original_size
         for idx, cat_id in enumerate(categories):
             if cat_id in self.category_id_to_idx:
                 cat_idx = self.category_id_to_idx[cat_id]
                 properties[idx, cat_idx] = 1.0
 
-            mask_bool = metadata[idx]["mask"]
+            # Use the resized/cropped mask to compute properties relative to the crop
+            mask_bool = masks[idx].numpy() > 0.5
             ys, xs = np.nonzero(mask_bool)
             if len(xs) == 0:
                 continue
@@ -530,8 +546,9 @@ class COCODataset(Dataset):
             xmin, xmax = xs.min(), xs.max()
             ymin, ymax = ys.min(), ys.max()
 
-            center_x = ((xmin + xmax + 1) / 2.0) / max(orig_w, 1)
-            center_y = ((ymin + ymax + 1) / 2.0) / max(orig_h, 1)
+            # Normalize by crop size
+            center_x = ((xmin + xmax + 1) / 2.0) / max(size, 1)
+            center_y = ((ymin + ymax + 1) / 2.0) / max(size, 1)
 
             properties[idx, self.num_categories] = float(2 * center_x - 1)
             properties[idx, self.num_categories + 1] = float(2 * center_y - 1)
@@ -613,7 +630,7 @@ class COCODataset(Dataset):
 
         if self.return_properties:
             props = self._build_properties(
-                category_ids, metadata, (sample["height"], sample["width"])
+                category_ids, masks_list, self.image_size
             )
             output["properties"] = props
 
@@ -625,14 +642,18 @@ class COCODataset(Dataset):
             areas_tensor = torch.zeros(num_instances, dtype=torch.float32)
             bboxes_tensor = torch.zeros(num_instances, 4, dtype=torch.float32)
 
-        orig_area = max(sample["width"] * sample["height"], 1)
-        for i in range(min(num_instances, len(metadata))):
-            meta = metadata[i]
-            area_px = float(meta.get("area", 0.0))
-            areas_tensor[i] = area_px / orig_area
+        crop_area = self.image_size * self.image_size
+        max_iter = min(num_instances, len(masks_list))
+        if self.max_objects is not None:
+            max_iter = min(max_iter, self.max_objects)
+        for i in range(max_iter):
+            # Use resized/cropped mask for area and bbox
+            mask_tensor = masks_list[i]
+            area_px = mask_tensor.sum().item()
+            areas_tensor[i] = area_px / crop_area
 
             x, y, bw, bh = self._bbox_from_mask(
-                meta["mask"], sample["width"], sample["height"]
+                mask_tensor.numpy() > 0.5, self.image_size, self.image_size
             )
             bboxes_tensor[i, 0] = x
             bboxes_tensor[i, 1] = y

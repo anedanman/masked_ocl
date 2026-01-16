@@ -198,7 +198,10 @@ def main():
     # Models
     dino, slot_attn, decoder, feat_dim = build_models(cfg, device)
     decoder_requires_known_tokens = bool(getattr(decoder, "requires_known_tokens", False))
-    
+    # Check if we need to extract CLS token for gaussian_pred init mode
+    init_mode = cfg.get("slots", {}).get("init_mode", "gaussian")
+    need_cls_token = init_mode == "gaussian_pred"
+
     # Freeze DINO
     if cfg["dino"].get("freeze", True):
         for p in dino.parameters():
@@ -355,11 +358,15 @@ def main():
 
             # OPTIMIZATION: Extract features with mixed precision for potential speedup
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == 'cuda')):
-                feats = extract_features(images, dino)
+                if need_cls_token:
+                    feats, cls_token = extract_features(images, dino, return_cls_token=True)
+                else:
+                    feats = extract_features(images, dino)
+                    cls_token = None
                 B, D, Hf, Wf = feats.shape
 
                 # Forward pass
-                slots, attn_vis = slot_attn(feats)
+                slots, attn_vis, init_loss = slot_attn(feats, cls_token=cls_token)
                 decoder_kwargs = {}
                 if decoder_requires_known_tokens:
                     decoder_kwargs["known_tokens"] = rearrange(feats, "b c h w -> b (h w) c")
@@ -367,6 +374,9 @@ def main():
                     decoder.set_step(global_step)
                 combined, recon_per_slot, dec_masks = decoder(slots, (Hf, Wf), **decoder_kwargs)
                 loss = F.mse_loss(combined, feats)
+                # Add init loss for gaussian_pred mode (trains MLP to predict good initializations)
+                if init_loss is not None:
+                    loss = loss + init_loss
 
             # Backward pass with gradient accumulation
             (loss / grad_accum_steps).backward()
@@ -490,9 +500,13 @@ def main():
 
                     # OPTIMIZATION: Use mixed precision for validation to save memory
                     with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == 'cuda')):
-                        feats = extract_features(images, dino)
+                        if need_cls_token:
+                            feats, cls_token = extract_features(images, dino, return_cls_token=True)
+                        else:
+                            feats = extract_features(images, dino)
+                            cls_token = None
                         B, D, Hf, Wf = feats.shape
-                        slots, attn_vis = slot_attn(feats)
+                        slots, attn_vis, _ = slot_attn(feats, cls_token=cls_token)
                         decoder_kwargs = {}
                         if decoder_requires_known_tokens:
                             decoder_kwargs["known_tokens"] = rearrange(feats, "b c h w -> b (h w) c")

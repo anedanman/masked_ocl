@@ -54,13 +54,17 @@ slots:
   input_size: null  # auto from DINO feature dim
   out_size: null    # auto from DINO feature dim
   mlp_hidden_size: 512
-  detach_last_iteration: true
+  # Truncation mode: 'none', 'fixed-point', or 'bi-level'
+  truncate: fixed-point
   qk_rmsnorm: false
   qk_rmsnorm_eps: 1.0e-6
   rope:
     rescale_coords: null
     shift_coords: null
     jitter_coords: null
+  # Slot initialization mode: 'gaussian' (default), 'kmeans' (cosine k-means), or 'gaussian_pred' (predict from DINO CLS token)
+  init_mode: gaussian
+  kmeans_iters: 10
 
 decoder:
   type: mlp  # 'mlp' or 'transformer'

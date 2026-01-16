@@ -1,6 +1,6 @@
 train:
   # Control training by total number of updates (steps)
-  max_updates: 150002
+  max_updates: 300002
   # Validation and logging intervals (in updates)
   val_every_updates: 10000
   log_every_updates: 1000
@@ -16,14 +16,14 @@ train:
     resume_latest: false # if true and resume_path is null, resume from latest in output.dir
   # Optim/loader
   batch_size: 64
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   val_batch_size: 32
-  learning_rate: 3.0e-4
+  learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   lr_schedule:
     type: cosine
-    warmup_steps: 2
-    min_lr: 1.0e-5
+    warmup_steps: 10000
+    min_lr: 1.0e-6
   num_workers: 16
   val_num_workers: 4
   grad_clip_norm: 1.0
@@ -32,8 +32,8 @@ train:
     mode: "reduce-overhead" # options: "default", "reduce-overhead", "max-autotune"
   images_only: true
   max_samples_train: null
-  max_samples_val: 1200
-  max_val_batches: 12
+  max_samples_val: 2000
+  max_val_batches: 20
   min_area: 0.0
   return_properties: false
 
@@ -41,7 +41,7 @@ data:
   dataset: coco
   root: ./data/coco
   image_size: 256
-  max_objects: 60
+  max_objects: 40
   train_split: train2017
   val_split: val2017
   train_horizontal_flip_prob: 0.5
@@ -54,17 +54,21 @@ slots:
   num_iterations: 3
   num_slots: 7
   num_heads: 1
-  slot_size: 768
+  slot_size: 256
   input_size: null  # auto from DINO feature dim
   out_size: null    # auto from DINO feature dim
-  mlp_hidden_size: 2048
-  detach_last_iteration: true
+  mlp_hidden_size: 1024
+  # Truncation mode: 'none', 'fixed-point', or 'bi-level'
+  truncate: bi-level
   qk_rmsnorm: false
   qk_rmsnorm_eps: 1.0e-6
   rope:
     rescale_coords: null
     shift_coords: null
     jitter_coords: null
+  # Slot initialization mode: 'gaussian' (default), 'kmeans' (cosine k-means), or 'gaussian_pred' (predict from DINO CLS token)
+  init_mode: gaussian_pred
+  kmeans_iters: 10
 
 decoder:
   type: autoregressive  # options: mlp, transformer, autoregressive
@@ -82,22 +86,25 @@ decoder:
     rope: {}
   autoregressive:
     qk_norm: false
-    depth: 10
-    mlp_hidden_dim: 2048
-    dropout: 0.1
+    depth: 4
+    decoder_dim: 768  # internal transformer dimension (defaults to slot_size if not set)
+    # mlp_hidden_dim: 2048  # FFN hidden dim (defaults to 4 * decoder_dim if not set)
+    dropout: 0.0
     order: random  # options: random, basic
+    use_prev_pos_embed: false  # if false, only use next position embedding (simpler for random order)
+    eval_num_permutations: 1  # number of random permutations to average at eval time (1 = no averaging)
     permutation_probability:
       start_value: 1.0
       end_value: 0.0
-      start_step: 50000
-      end_step: 100000
+      start_step: 75000
+      end_step: 150000
     rope: {}
 
 wandb:
   enabled: true
   project: slot-dino
   entity: null
-  run_name: dinosaur_coco_autoregressive_7objs_detach_bdino_random_10depth
+  run_name: coco_autoregressive_7objs_fixed-point_Bdino_random_pred0.0
   mode: online
 
 output:

@@ -97,6 +97,9 @@ def main():
 
     dino, slot_mae, decoder, feat_dim = build_slot_mae_components(cfg, device)
     decoder_requires_known_tokens = bool(getattr(decoder, "requires_known_tokens", False))
+    # Check if we need to extract CLS token for gaussian_pred init mode
+    init_mode = cfg.get("slots", {}).get("init_mode", "gaussian")
+    need_cls_token = init_mode == "gaussian_pred"
     if cfg["dino"].get("freeze", True):
         for p in dino.parameters():
             p.requires_grad_(False)
@@ -154,6 +157,9 @@ def main():
 
     global_step = 0
     recon_loss_type = str(train_cfg.get("reconstruction_loss", train_cfg.get("loss", "l1")))
+    recon_scope = str(train_cfg.get("reconstruction_scope", "masked")).lower()
+    if recon_scope not in ("masked", "full"):
+        raise ValueError("train.reconstruction_scope must be 'masked' or 'full'.")
     best_val_loss = float("inf")
     best_val_step = -1
 
@@ -242,7 +248,11 @@ def main():
                 gt_masks = gt_masks.to(device, non_blocking=True)
 
             with torch.autocast(**autocast_kwargs):
-                feats = extract_features(images, dino)
+                if need_cls_token:
+                    feats, cls_token = extract_features(images, dino, return_cls_token=True)
+                else:
+                    feats = extract_features(images, dino)
+                    cls_token = None
                 B, D, Hf, Wf = feats.shape
                 slot_noise = slot_mae.sample_slot_noise(B, device=feats.device, dtype=feats.dtype)
 
@@ -250,6 +260,7 @@ def main():
                     feats,
                     step=global_step,
                     slot_noise=slot_noise,
+                    cls_token=cls_token,
                 )
 
                 target_flat = rearrange(feats, "b c h w -> b (h w) c")
@@ -264,7 +275,11 @@ def main():
                 decoder_out = decoder(output.reconstruction_slots, (Hf, Wf), **decoder_kwargs)
                 per_slot_preds, combined_preds, decoder_masks = _parse_decoder_output(decoder_out)
 
-                weights = output.assignments * output.mask_batch.target_mask.float()
+                masked_weights = output.assignments * output.mask_batch.target_mask.float()
+                if recon_scope == "full":
+                    weights = output.assignments
+                else:
+                    weights = masked_weights
                 if per_slot_preds is None:
                     if combined_preds is None:
                         raise ValueError("Decoder must provide combined predictions when per-slot outputs are missing.")
@@ -275,8 +290,11 @@ def main():
                     weight_tensor = weights
 
                 loss_value = weighted_recon_loss(preds_flat, target_flat, weight_tensor, loss_type=recon_loss_type)
+                # Add init loss for gaussian_pred mode (trains MLP to predict good initializations)
+                if output.init_loss is not None:
+                    loss_value = loss_value + output.init_loss
 
-                masked_mass = (weights.sum() / output.assignments.sum().clamp_min(1e-6)).detach()
+                masked_mass = (masked_weights.sum() / output.assignments.sum().clamp_min(1e-6)).detach()
                 mask_ratio = (
                     output.mask_batch.ratio.detach()
                     if isinstance(output.mask_batch.ratio, torch.Tensor)
@@ -422,7 +440,11 @@ def main():
                             target_sets["semantic"] = semantic_masks
 
                     with torch.autocast(**autocast_kwargs):
-                        feats = extract_features(images, dino)
+                        if need_cls_token:
+                            feats, cls_token = extract_features(images, dino, return_cls_token=True)
+                        else:
+                            feats = extract_features(images, dino)
+                            cls_token = None
                         B, D, Hf, Wf = feats.shape
                         slot_noise = slot_mae.sample_slot_noise(B, device=feats.device, dtype=feats.dtype)
 
@@ -430,6 +452,7 @@ def main():
                             feats,
                             step=global_step,
                             slot_noise=slot_noise,
+                            cls_token=cls_token,
                         )
 
                         target_flat = rearrange(feats, "b c h w -> b (h w) c")
@@ -444,7 +467,10 @@ def main():
                         decoder_out = decoder(output.reconstruction_slots, (Hf, Wf), **decoder_kwargs)
                         per_slot_preds, combined_preds, decoder_masks = _parse_decoder_output(decoder_out)
 
-                        weights = output.assignments * output.mask_batch.target_mask.float()
+                        if recon_scope == "full":
+                            weights = output.assignments
+                        else:
+                            weights = output.assignments * output.mask_batch.target_mask.float()
                         if per_slot_preds is None:
                             if combined_preds is None:
                                 raise ValueError(

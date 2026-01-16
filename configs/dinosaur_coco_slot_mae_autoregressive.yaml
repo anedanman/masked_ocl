@@ -57,10 +57,14 @@ slots:
   input_size: null
   out_size: null
   mlp_hidden_size: 1536
-  detach_last_iteration: true
+  # Truncation mode: 'none', 'fixed-point', or 'bi-level'
+  truncate: fixed-point
   qk_rmsnorm: false
   qk_rmsnorm_eps: 1.0e-6
   rope: {}
+  # Slot initialization mode: 'gaussian' (default), 'kmeans' (cosine k-means), or 'gaussian_pred' (predict from DINO CLS token)
+  init_mode: gaussian
+  kmeans_iters: 10
   # For masked pass: use teacher-guided attention with straight-through grads
   guided_grad_substitute: true
 
@@ -78,10 +82,13 @@ decoder:
   autoregressive:
     qk_norm: true
     depth: 6
-    mlp_hidden_dim: 1536
+    decoder_dim: 384  # internal transformer dimension (defaults to slot_size if not set)
+    mlp_hidden_dim: 1536  # FFN hidden dim (defaults to 4 * decoder_dim if not set)
     dropout: 0.1
     order: random  # options: random, left_to_right
     mode: slate     # options: spot, slate
+    use_prev_pos_embed: false  # if false, only use next position embedding (simpler for random order)
+    eval_num_permutations: 1  # number of random permutations to average at eval time (1 = no averaging)
     permutation_probability:
       start_value: 1.0
       end_value: 1.0

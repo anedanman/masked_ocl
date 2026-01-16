@@ -55,19 +55,32 @@ def load_dino_model(size: str = "s", device: str = "cuda") -> torch.nn.Module:
 def dino_patch_extraction(
         images: torch.Tensor,
         model,
-) -> torch.Tensor:
+        return_cls_token: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Extracts patch embeddings from images using a pretrained DINO model.
 
     Args:
         images (torch.Tensor): Input images of shape (B, C, H, W).
         model: Pretrained DINO model.
+        return_cls_token (bool): If True, also return the CLS token.
 
     Returns:
-        torch.Tensor: Patch embeddings of shape (B, D, H // 16, W // 16)
+        If return_cls_token is False:
+            torch.Tensor: Patch embeddings of shape (B, D, H // 16, W // 16)
+        If return_cls_token is True:
+            Tuple[torch.Tensor, torch.Tensor]: (patch_embeddings, cls_token)
+                - patch_embeddings: (B, D, H // 16, W // 16)
+                - cls_token: (B, D)
     """
-    features = model.forward_features(images)['x_norm_patchtokens']
-    return features.permute(0, 2, 1).reshape(features.size(0), -1, int(images.size(2) / 16), int(images.size(3) / 16))
+    out = model.forward_features(images)
+    features = out['x_norm_patchtokens']
+    patch_embeddings = features.permute(0, 2, 1).reshape(features.size(0), -1, int(images.size(2) / 16), int(images.size(3) / 16))
+
+    if return_cls_token:
+        cls_token = out['x_norm_clstoken']
+        return patch_embeddings, cls_token
+    return patch_embeddings
 
 
 def tensor_to_one_hot(tensor: torch.Tensor, dim: int) -> torch.Tensor:
@@ -210,8 +223,12 @@ def maybe_compile(module: nn.Module, enabled: bool) -> nn.Module:
 
 
 @torch.no_grad()
-def extract_features(images: torch.Tensor, dino) -> torch.Tensor:
-    return dino_patch_extraction(images, dino)
+def extract_features(
+    images: torch.Tensor,
+    dino,
+    return_cls_token: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    return dino_patch_extraction(images, dino, return_cls_token=return_cls_token)
 
 
 def attn_to_slot_masks(attn_vis: torch.Tensor, H: int, W: int) -> torch.Tensor:
@@ -231,14 +248,27 @@ def denormalize_image(img: torch.Tensor) -> torch.Tensor:
     return torch.clamp(img * std + mean, 0.0, 1.0)
 
 
-def colorize_masks(masks: torch.Tensor, seed: int = 42) -> torch.Tensor:
+def colorize_masks(masks: torch.Tensor, seed: int = 42, bg_threshold: float = 1e-6) -> torch.Tensor:
     if masks.ndim != 3:
         raise ValueError("masks must have shape [K, H, W]")
     K, H, W = masks.shape
     labels = masks.argmax(dim=0)
+
+    # Detect background pixels: where max mask value is below threshold
+    # For binary GT masks, background has all zeros; for soft masks, low max indicates uncertainty
+    max_vals = masks.max(dim=0).values
+    is_background = max_vals < bg_threshold
+
     rng = torch.Generator(device=masks.device)
     rng.manual_seed(seed)
+    # Palette: K colors for masks + 1 for background (index K)
     palette = torch.rand((K + 1, 3), generator=rng, device=masks.device)
+    palette[K] = 0.0  # Background is black
+
+    # Assign background pixels to the background color slot
+    labels = labels.clone()
+    labels[is_background] = K
+
     colored = palette[labels]
     return colored.permute(2, 0, 1).contiguous()
 
@@ -363,9 +393,11 @@ def build_models(cfg: Dict[str, Any], device: torch.device):
         rescale_coords=sa_cfg.get("rope", {}).get("rescale_coords", None),
         shift_coords=sa_cfg.get("rope", {}).get("shift_coords", None),
         jitter_coords=sa_cfg.get("rope", {}).get("jitter_coords", None),
-        detach_last_iteration=sa_cfg.get("detach_last_iteration", False),
+        truncate=sa_cfg.get("truncate", "none"),
         qk_rmsnorm=sa_cfg.get("qk_rmsnorm", False),
         qk_rmsnorm_eps=sa_cfg.get("qk_rmsnorm_eps", 1e-6),
+        init_mode=sa_cfg.get("init_mode", "gaussian"),
+        kmeans_iters=sa_cfg.get("kmeans_iters", 10),
     ).to(device)
 
     dec_cfg = cfg["decoder"]
@@ -384,18 +416,23 @@ def build_models(cfg: Dict[str, Any], device: torch.device):
             ).to(device)
         elif decoder_type == "autoregressive":
             ar_cfg = dec_cfg.get("autoregressive", {})
+            decoder_dim = ar_cfg.get("decoder_dim", None)  # None means use slot_size
+            mlp_hidden_dim = ar_cfg.get("mlp_hidden_dim", None)  # None means 4 * decoder_dim
             decoder = SlotAutoregressiveTransformerDecoder(
                 slot_size=sa_cfg["slot_size"],
                 feat_dim=feat_dim,
                 depth=int(ar_cfg.get("depth", dec_cfg.get("depth", 4))),
                 num_heads=int(dec_cfg.get("num_heads", num_heads)),
-                mlp_hidden_dim=int(ar_cfg.get("mlp_hidden_dim", 4 * sa_cfg["slot_size"])),
+                mlp_hidden_dim=int(mlp_hidden_dim) if mlp_hidden_dim is not None else None,
+                decoder_dim=int(decoder_dim) if decoder_dim is not None else None,
                 dropout=float(ar_cfg.get("dropout", 0.0)),
                 prediction_order=str(ar_cfg.get("order", "random")),
                 rope_kwargs=ar_cfg.get("rope", {}),
                 mode=str(ar_cfg.get("mode", "spot")),
                 permutation_probability=ar_cfg.get("permutation_probability", None),
                 use_qk_norm=bool(ar_cfg.get("qk_norm", True)),
+                use_prev_pos_embed=bool(ar_cfg.get("use_prev_pos_embed", True)),
+                eval_num_permutations=int(ar_cfg.get("eval_num_permutations", 1)),
             ).to(device)
         else:
             transformer_cfg = dec_cfg["transformer"]
@@ -508,9 +545,11 @@ def build_slot_jepa_components(cfg: Dict[str, Any], device: torch.device):
         rescale_coords=sa_cfg.get("rope", {}).get("rescale_coords", None),
         shift_coords=sa_cfg.get("rope", {}).get("shift_coords", None),
         jitter_coords=sa_cfg.get("rope", {}).get("jitter_coords", None),
-        detach_last_iteration=sa_cfg.get("detach_last_iteration", False),
+        truncate=sa_cfg.get("truncate", "none"),
         qk_rmsnorm=sa_cfg.get("qk_rmsnorm", False),
         qk_rmsnorm_eps=sa_cfg.get("qk_rmsnorm_eps", 1e-6),
+        init_mode=sa_cfg.get("init_mode", "gaussian"),
+        kmeans_iters=sa_cfg.get("kmeans_iters", 10),
     ).to(device)
 
     teacher_student_cfg = cfg.get("teacher_student", {})

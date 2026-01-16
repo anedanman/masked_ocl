@@ -660,19 +660,26 @@ class SlotAutoregressiveTransformerDecoder(nn.Module):
         depth: int = 4,
         num_heads: int = 4,
         mlp_hidden_dim: Optional[int] = None,
+        decoder_dim: Optional[int] = None,
         dropout: float = 0.0,
         prediction_order: str = "random",
         rope_kwargs: Optional[dict] = None,  # kept for config compatibility
         mode: str = "spot",
         permutation_probability: Optional[Any] = None,
         use_qk_norm: bool = True,
+        use_prev_pos_embed: bool = True,
+        eval_num_permutations: int = 1,
     ) -> None:
         super().__init__()
         if depth < 1:
             raise ValueError("Autoregressive decoder depth must be >= 1.")
-        if slot_size % num_heads != 0:
+
+        # Decoder internal dimension (defaults to slot_size for backward compatibility)
+        decoder_dim = decoder_dim if decoder_dim is not None else slot_size
+
+        if decoder_dim % num_heads != 0:
             raise ValueError(
-                f"slot_size ({slot_size}) must be divisible by num_heads ({num_heads}) for attention heads."
+                f"decoder_dim ({decoder_dim}) must be divisible by num_heads ({num_heads}) for attention heads."
             )
 
         order = prediction_order.lower()
@@ -682,9 +689,12 @@ class SlotAutoregressiveTransformerDecoder(nn.Module):
             raise ValueError("prediction_order must be 'basic'/'left_to_right' or 'random'.")
 
         self.slot_size = slot_size
+        self.decoder_dim = decoder_dim
         self.feat_dim = feat_dim
         self.prediction_order = order
         self.mode = mode.lower() if isinstance(mode, str) else "spot"
+        self.use_prev_pos_embed = use_prev_pos_embed
+        self.eval_num_permutations = max(1, eval_num_permutations)
         self._current_step = 0
         default_prob = 1.0 if order == "random" else 0.0
         if isinstance(permutation_probability, dict):
@@ -705,11 +715,11 @@ class SlotAutoregressiveTransformerDecoder(nn.Module):
             start_step,
             end_step,
         )
-        hidden_dim = mlp_hidden_dim or (4 * slot_size)
+        hidden_dim = mlp_hidden_dim or (4 * decoder_dim)
 
         self.blocks = nn.ModuleList([
             AutoregressiveDecoderBlock(
-                slot_size,
+                decoder_dim,
                 num_heads=num_heads,
                 mlp_hidden_dim=hidden_dim,
                 dropout=dropout,
@@ -719,9 +729,17 @@ class SlotAutoregressiveTransformerDecoder(nn.Module):
         ])
 
         self.slot_norm = nn.LayerNorm(slot_size)
-        self.token_proj = nn.Linear(feat_dim, slot_size)
-        self.final_ln = nn.LayerNorm(slot_size)
-        self.out_proj = nn.Linear(slot_size, feat_dim)
+        # Project slots to decoder_dim for cross-attention (identity if decoder_dim == slot_size)
+        if decoder_dim != slot_size:
+            self.slot_proj = nn.Sequential(
+                nn.Linear(slot_size, decoder_dim, bias=False),
+                nn.LayerNorm(decoder_dim),
+            )
+        else:
+            self.slot_proj = nn.Identity()
+        self.token_proj = nn.Linear(feat_dim, decoder_dim)
+        self.final_ln = nn.LayerNorm(decoder_dim)
+        self.out_proj = nn.Linear(decoder_dim, feat_dim)
         self.bos_token = nn.Parameter(torch.zeros(1, 1, feat_dim))
         nn.init.trunc_normal_(self.bos_token, std=0.02)
         pos_hidden = max(feat_dim, 128)
@@ -804,6 +822,92 @@ class SlotAutoregressiveTransformerDecoder(nn.Module):
             orders[mask] = rand_perms
         return orders
 
+    def _forward_single(
+        self,
+        slots: torch.Tensor,
+        target_seq: torch.Tensor,
+        gt_mask: torch.Tensor,
+        pos_table: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Single-permutation forward pass. Returns (combined, decoder_mask)."""
+        batch_size, num_slots, _ = slots.shape
+        num_tokens = height * width
+        device = slots.device
+        dtype = slots.dtype
+
+        order = self._select_order(batch_size, num_tokens, device=device)
+        inv_perm = torch.argsort(order, dim=1)
+        gather_feat_idx = order.unsqueeze(-1).expand(-1, -1, self.feat_dim)
+        target_perm = torch.gather(target_seq, 1, gather_feat_idx)
+        mask_perm = torch.gather(gt_mask, 1, order)
+
+        next_pos_embed = torch.gather(pos_table, 1, gather_feat_idx)
+
+        bos = self.bos_token.to(device=device, dtype=dtype).expand(batch_size, 1, -1)
+        if num_tokens > 1:
+            shifted = target_perm[:, :-1, :]
+            mask_shifted = mask_perm[:, :-1]
+            prev_pos = next_pos_embed[:, :-1, :]
+        else:
+            shifted = target_perm[:, :0, :]
+            mask_shifted = mask_perm[:, :0]
+            prev_pos = next_pos_embed[:, :0, :]
+
+        decoder_input = torch.cat([bos, shifted], dim=1)
+        context_mask = torch.cat(
+            [
+                torch.ones(batch_size, 1, device=device, dtype=torch.bool),
+                mask_shifted,
+            ],
+            dim=1,
+        )
+        decoder_input = decoder_input * context_mask.unsqueeze(-1).to(decoder_input.dtype)
+
+        if self.use_prev_pos_embed:
+            prev_pos = torch.cat(
+                [torch.zeros(batch_size, 1, self.feat_dim, device=device, dtype=dtype), prev_pos],
+                dim=1,
+            )
+            decoder_input = decoder_input + prev_pos + next_pos_embed
+        else:
+            decoder_input = decoder_input + next_pos_embed
+
+        tokens = self.token_proj(decoder_input)
+        slot_memory = self.slot_proj(self.slot_norm(slots))
+        attn_mask = self._build_causal_mask(num_tokens, device=device)
+        padding_mask = ~context_mask
+
+        cross_sum: Optional[torch.Tensor] = None
+        for block in self.blocks:
+            tokens, cross_weights = block(
+                tokens,
+                slot_memory,
+                attn_mask,
+                key_padding_mask=padding_mask,
+                need_weights=True,
+            )
+            if cross_weights is not None:
+                cross_sum = cross_weights if cross_sum is None else cross_sum + cross_weights
+
+        tokens = self.final_ln(tokens)
+        preds = self.out_proj(tokens)
+        inv_feat_idx = inv_perm.unsqueeze(-1).expand(-1, -1, preds.shape[-1])
+        preds = torch.gather(preds, 1, inv_feat_idx)
+        combined = rearrange(preds, "b (h w) c -> b c h w", h=height, w=width)
+
+        decoder_mask = None
+        if cross_sum is not None:
+            attn = (cross_sum / len(self.blocks)).sum(dim=1)
+            attn = F.softmax(attn, dim=-1)
+            inv_token_idx = inv_perm.unsqueeze(-1).expand(-1, -1, attn.shape[2])
+            attn = torch.gather(attn, 1, inv_token_idx)
+            decoder_mask = attn.permute(0, 2, 1).contiguous().view(batch_size, num_slots, height, width)
+            decoder_mask = decoder_mask.unsqueeze(2)
+
+        return combined, decoder_mask
+
     def forward(
         self,
         slots: torch.Tensor,
@@ -845,72 +949,31 @@ class SlotAutoregressiveTransformerDecoder(nn.Module):
         else:
             gt_mask = flat_mask.bool()
 
-        order = self._select_order(batch_size, num_tokens, device=device)
-        inv_perm = torch.argsort(order, dim=1)
-        gather_feat_idx = order.unsqueeze(-1).expand(-1, -1, self.feat_dim)
-        target_perm = torch.gather(target_seq, 1, gather_feat_idx)
-        mask_perm = torch.gather(gt_mask, 1, order)
-
+        # Precompute positional encoding table (shared across permutations)
         pos_table = self._positional_encoding(height, width, device=device, dtype=dtype)
         pos_table = pos_table.unsqueeze(0).expand(batch_size, -1, -1)
-        next_pos_embed = torch.gather(pos_table, 1, gather_feat_idx)
 
-        bos = self.bos_token.to(device=device, dtype=dtype).expand(batch_size, 1, -1)
-        if num_tokens > 1:
-            shifted = target_perm[:, :-1, :]
-            mask_shifted = mask_perm[:, :-1]
-            prev_pos = next_pos_embed[:, :-1, :]
-        else:
-            shifted = target_perm[:, :0, :]
-            mask_shifted = mask_perm[:, :0]
-            prev_pos = next_pos_embed[:, :0, :]
+        # Determine number of permutations to run
+        num_perms = 1 if self.training else self.eval_num_permutations
 
-        decoder_input = torch.cat([bos, shifted], dim=1)
-        context_mask = torch.cat(
-            [
-                torch.ones(batch_size, 1, device=device, dtype=torch.bool),
-                mask_shifted,
-            ],
-            dim=1,
-        )
-        decoder_input = decoder_input * context_mask.unsqueeze(-1).to(decoder_input.dtype)
-
-        prev_pos = torch.cat(
-            [torch.zeros(batch_size, 1, self.feat_dim, device=device, dtype=dtype), prev_pos],
-            dim=1,
-        )
-        decoder_input = decoder_input + prev_pos + next_pos_embed
-
-        tokens = self.token_proj(decoder_input)
-        slot_memory = self.slot_norm(slots)
-        attn_mask = self._build_causal_mask(num_tokens, device=device)
-        padding_mask = ~context_mask
-
-        cross_sum: Optional[torch.Tensor] = None
-        for block in self.blocks:
-            tokens, cross_weights = block(
-                tokens,
-                slot_memory,
-                attn_mask,
-                key_padding_mask=padding_mask,
-                need_weights=True,
+        if num_perms == 1:
+            # Single permutation (training or eval with num_perms=1)
+            combined, decoder_mask = self._forward_single(
+                slots, target_seq, gt_mask, pos_table, height, width
             )
-            if cross_weights is not None:
-                cross_sum = cross_weights if cross_sum is None else cross_sum + cross_weights
+        else:
+            # Multiple permutations at eval time - average outputs
+            all_combined = []
+            all_masks = []
+            for _ in range(num_perms):
+                combined, decoder_mask = self._forward_single(
+                    slots, target_seq, gt_mask, pos_table, height, width
+                )
+                all_combined.append(combined)
+                if decoder_mask is not None:
+                    all_masks.append(decoder_mask)
 
-        tokens = self.final_ln(tokens)
-        preds = self.out_proj(tokens)
-        inv_feat_idx = inv_perm.unsqueeze(-1).expand(-1, -1, preds.shape[-1])
-        preds = torch.gather(preds, 1, inv_feat_idx)
-        combined = rearrange(preds, "b (h w) c -> b c h w", h=height, w=width)
-
-        decoder_mask = None
-        if cross_sum is not None:
-            attn = (cross_sum / len(self.blocks)).sum(dim=1)
-            attn = F.softmax(attn, dim=-1)
-            inv_token_idx = inv_perm.unsqueeze(-1).expand(-1, -1, attn.shape[2])
-            attn = torch.gather(attn, 1, inv_token_idx)
-            decoder_mask = attn.permute(0, 2, 1).contiguous().view(batch_size, num_slots, height, width)
-            decoder_mask = decoder_mask.unsqueeze(2)
+            combined = torch.stack(all_combined, dim=0).mean(dim=0)
+            decoder_mask = torch.stack(all_masks, dim=0).mean(dim=0) if all_masks else None
 
         return combined, None, decoder_mask
