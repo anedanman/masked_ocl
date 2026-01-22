@@ -1,4 +1,5 @@
 train:
+  gpu: null  # GPU index as shown in nvidia-smi (null = auto, or specify 0, 1, 2, etc.)
   max_updates: 100002
   val_every_updates: 10000
   log_every_updates: 500

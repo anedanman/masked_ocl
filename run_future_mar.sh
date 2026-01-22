@@ -2,6 +2,7 @@
 set -euo pipefail
 
 CONDA_ENV="${CONDA_ENV:-base}"
+GPU="${GPU:-0}"  # GPU index as shown in nvidia-smi (override with GPU=1 ./run_future_mar.sh)
 
 if command -v conda >/dev/null 2>&1; then
   # shellcheck disable=SC1091
@@ -26,6 +27,6 @@ for cfg in "${configs[@]}"; do
     echo "Config not found: $cfg" >&2
     exit 1
   fi
-  echo "==> Running train_mar.py with $cfg"
-  python train_mar.py --config "$cfg"
+  echo "==> Running train_mar.py with $cfg on GPU $GPU"
+  python train_mar.py --config "$cfg" --gpu "$GPU"
 done

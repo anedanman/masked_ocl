@@ -388,10 +388,18 @@ def _maybe_extract_features(
 def main():
     parser = argparse.ArgumentParser(description="MAR-style training for slot-based masked prediction.")
     parser.add_argument("--config", type=str, default="configs/dinosaur_coco_mar.yaml", help="Path to YAML config")
+    parser.add_argument("--gpu", type=int, default=None, help="GPU index as shown in nvidia-smi (overrides config)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     train_cfg = cfg.get("train", {})
+
+    # GPU selection - set CUDA_VISIBLE_DEVICES before any CUDA operations
+    # CLI argument takes precedence over config
+    gpu_id = args.gpu if args.gpu is not None else train_cfg.get("gpu", None)
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        print(f"Using GPU {gpu_id} (CUDA_VISIBLE_DEVICES={gpu_id})")
     seed_value = train_cfg.get("seed", None)
     if seed_value is not None and not isinstance(seed_value, int):
         seed_value = int(seed_value)
