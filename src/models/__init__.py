@@ -5,6 +5,7 @@ from src.models.slot_attn import MultiHeadSTEVESA
 from src.models.slot_mae import SlotMAEOutput, SlotMaskedAutoencoder
 from src.models.slot_jepa import SlotJEPAOutput, SlotJEPATeacherStudent
 from src.models.slot_masks import SlotMaskBatch, SlotMaskGenerator
+from src.models.slot_mar import SlotMAROutput, SlotMARDecoder
 from src.models.decoders import (
     SlotMLPDecoder,
     SlotTransformerDecoder,
@@ -21,6 +22,8 @@ __all__ = [
     "SlotJEPATeacherStudent",
     "SlotMaskBatch",
     "SlotMaskGenerator",
+    "SlotMAROutput",
+    "SlotMARDecoder",
     "SlotMLPDecoder",
     "SlotTransformerDecoder",
     "SlotJEPADecoder",

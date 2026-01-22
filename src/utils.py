@@ -641,6 +641,88 @@ def build_slot_mae_components(cfg: Dict[str, Any], device: torch.device):
     return dino, slot_mae, decoder, feat_dim
 
 
+def build_slot_mar_components(cfg: Dict[str, Any], device: torch.device):
+    """
+    Construct the DINO backbone, slot attention, and MAR-style decoder for training.
+    """
+    from src.models.slot_mar import SlotMARDecoder
+    from src.models.slot_attn import MultiHeadSTEVESA
+
+    dino = load_dino_model(size=cfg["dino"]["size"], device=str(device))
+    dino.eval()
+
+    sa_cfg = cfg["slots"]
+    input_size = sa_cfg.get("input_size", None)
+    out_size = sa_cfg.get("out_size", None)
+    num_heads = sa_cfg["num_heads"]
+    if input_size is None or out_size is None:
+        dummy = torch.zeros(1, 3, cfg["data"]["image_size"], cfg["data"]["image_size"], device=device)
+        with torch.no_grad():
+            feats = extract_features(dummy, dino)
+        feat_dim = feats.shape[1]
+        input_size = feat_dim if input_size is None else input_size
+        out_size = feat_dim if out_size is None else out_size
+    else:
+        feat_dim = input_size
+
+    slot_attn = MultiHeadSTEVESA(
+        num_iterations=sa_cfg["num_iterations"],
+        num_slots=sa_cfg["num_slots"],
+        num_heads=num_heads,
+        input_size=input_size,
+        out_size=sa_cfg["slot_size"],
+        slot_size=sa_cfg["slot_size"],
+        mlp_hidden_size=sa_cfg["mlp_hidden_size"],
+        rescale_coords=sa_cfg.get("rope", {}).get("rescale_coords", None),
+        shift_coords=sa_cfg.get("rope", {}).get("shift_coords", None),
+        jitter_coords=sa_cfg.get("rope", {}).get("jitter_coords", None),
+        truncate=sa_cfg.get("truncate", "none"),
+        qk_rmsnorm=sa_cfg.get("qk_rmsnorm", False),
+        qk_rmsnorm_eps=sa_cfg.get("qk_rmsnorm_eps", 1e-6),
+        init_mode=sa_cfg.get("init_mode", "gaussian"),
+        kmeans_iters=sa_cfg.get("kmeans_iters", 10),
+    ).to(device)
+
+    mar_cfg = cfg.get("mar", {})
+    mask_cfg = cfg.get("masking", {})
+    ratio_min = mask_cfg.get("ratio_min", mask_cfg.get("ratio", 0.7))
+    ratio_max = mask_cfg.get("ratio_max", mask_cfg.get("ratio", ratio_min))
+
+    decoder = SlotMARDecoder(
+        slot_size=sa_cfg["slot_size"],
+        feat_dim=feat_dim,
+        model_dim=mar_cfg.get("model_dim", sa_cfg["slot_size"]),
+        encoder_depth=int(mar_cfg.get("encoder_depth", 4)),
+        decoder_depth=int(mar_cfg.get("decoder_depth", 4)),
+        num_heads=int(mar_cfg.get("num_heads", num_heads)),
+        mlp_hidden_dim=mar_cfg.get("mlp_hidden_dim", None),
+        dropout=float(mar_cfg.get("dropout", 0.0)),
+        self_attn_type=str(mar_cfg.get("self_attn_type", "full")),
+        prediction_order=str(mar_cfg.get("prediction_order", "random")),
+        predict_tokens=mar_cfg.get("predict_tokens", None),
+        buffer_size=int(mar_cfg.get("buffer_size", 64)),
+        register_slots=int(mar_cfg.get("register_slots", 0)),
+        slot_conditioned=bool(mar_cfg.get("slot_conditioned", False)),
+        slot_conditional_depth=int(mar_cfg.get("slot_conditional_depth", 1)),
+        slot_conditional_dropout=float(mar_cfg.get("slot_conditional_dropout", 0.0)),
+        slot_conditional_qk_norm=bool(mar_cfg.get("slot_conditional_qk_norm", True)),
+        slot_conditional_embed=bool(mar_cfg.get("slot_conditional_embed", False)),
+        add_pos_to_known=bool(mar_cfg.get("add_pos_to_known", True)),
+        mask_ratio_min=float(ratio_min),
+        mask_ratio_max=float(ratio_max),
+        mask_ratio_mode=str(mask_cfg.get("ratio_mode", mar_cfg.get("mask_ratio_mode", "truncated_gaussian"))),
+        mask_ratio_std=float(mask_cfg.get("ratio_std", mar_cfg.get("mask_ratio_std", 0.25))),
+        masking_strategy=str(mask_cfg.get("strategy", mar_cfg.get("masking_strategy", "order"))),
+        use_qk_norm=bool(mar_cfg.get("qk_norm", True)),
+        use_bos_token=bool(mar_cfg.get("use_bos_token", False)),
+        pos_embed_type=str(mar_cfg.get("pos_embed_type", "learned")),
+        max_seq_len=int(mar_cfg.get("max_seq_len", 256)),
+        use_torch_sampling=bool(mar_cfg.get("use_torch_sampling", True)),
+    ).to(device)
+
+    return dino, slot_attn, decoder, feat_dim
+
+
 def build_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     sched_cfg: Optional[Dict[str, Any]],
@@ -728,6 +810,7 @@ def save_checkpoint(
     cfg: Dict[str, Any],
     step: int,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    ema_params: Optional[List[torch.Tensor]] = None,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     state = {
@@ -742,6 +825,8 @@ def save_checkpoint(
             state["scheduler"] = scheduler.state_dict()
         except Exception:
             pass
+    if ema_params is not None:
+        state["ema"] = ema_params_to_state_dict(ema_params, [slot_attn, decoder])
     torch.save(state, path)
 
 
@@ -782,3 +867,140 @@ def prepare_run_dir(cfg: Dict[str, Any], config_path: str) -> str:
     except Exception:
         pass
     return out_dir
+
+
+# ------------------------------
+# EMA (Exponential Moving Average) utilities
+# ------------------------------
+
+
+def create_ema_params(modules: List[nn.Module]) -> List[torch.Tensor]:
+    """Create a list of EMA parameter tensors from a list of modules.
+
+    Args:
+        modules: List of nn.Module instances whose parameters will be tracked.
+
+    Returns:
+        List of cloned parameter tensors (detached from computation graph).
+    """
+    ema_params = []
+    for module in modules:
+        for param in module.parameters():
+            ema_params.append(param.data.clone().detach())
+    return ema_params
+
+
+@torch.no_grad()
+def update_ema(
+    ema_params: List[torch.Tensor],
+    modules: List[nn.Module],
+    rate: float = 0.9999,
+) -> None:
+    """Update EMA parameters using exponential moving average.
+
+    EMA update rule: ema = rate * ema + (1 - rate) * current
+
+    Args:
+        ema_params: List of EMA parameter tensors to update in-place.
+        modules: List of nn.Module instances with current parameters.
+        rate: EMA decay rate (closer to 1 means slower updates). Default 0.9999.
+    """
+    idx = 0
+    for module in modules:
+        for param in module.parameters():
+            ema_params[idx].mul_(rate).add_(param.data, alpha=1.0 - rate)
+            idx += 1
+
+
+def load_ema_to_model(
+    ema_params: List[torch.Tensor],
+    modules: List[nn.Module],
+) -> List[torch.Tensor]:
+    """Load EMA parameters into model modules, returning original parameters.
+
+    This is useful for temporarily swapping in EMA weights for evaluation.
+    Call restore_model_params() afterward to restore original weights.
+
+    Args:
+        ema_params: List of EMA parameter tensors.
+        modules: List of nn.Module instances to load parameters into.
+
+    Returns:
+        List of original parameter tensors (for later restoration).
+    """
+    original_params = []
+    idx = 0
+    for module in modules:
+        for param in module.parameters():
+            original_params.append(param.data.clone())
+            param.data.copy_(ema_params[idx])
+            idx += 1
+    return original_params
+
+
+def restore_model_params(
+    original_params: List[torch.Tensor],
+    modules: List[nn.Module],
+) -> None:
+    """Restore original parameters to model modules after EMA evaluation.
+
+    Args:
+        original_params: List of original parameter tensors from load_ema_to_model.
+        modules: List of nn.Module instances to restore parameters to.
+    """
+    idx = 0
+    for module in modules:
+        for param in module.parameters():
+            param.data.copy_(original_params[idx])
+            idx += 1
+
+
+def ema_params_to_state_dict(
+    ema_params: List[torch.Tensor],
+    modules: List[nn.Module],
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Convert EMA parameters to a state dict format for saving.
+
+    Args:
+        ema_params: List of EMA parameter tensors.
+        modules: List of nn.Module instances (used for parameter names).
+
+    Returns:
+        Dict mapping module index to state dict of EMA parameters.
+    """
+    result = {}
+    idx = 0
+    for mod_idx, module in enumerate(modules):
+        state_dict = {}
+        for name, param in module.named_parameters():
+            state_dict[name] = ema_params[idx].clone()
+            idx += 1
+        result[f"module_{mod_idx}"] = state_dict
+    return result
+
+
+def state_dict_to_ema_params(
+    ema_state: Dict[str, Dict[str, torch.Tensor]],
+    modules: List[nn.Module],
+    device: torch.device,
+) -> List[torch.Tensor]:
+    """Load EMA parameters from a state dict format.
+
+    Args:
+        ema_state: Dict from ema_params_to_state_dict.
+        modules: List of nn.Module instances.
+        device: Device to load parameters onto.
+
+    Returns:
+        List of EMA parameter tensors.
+    """
+    ema_params = []
+    for mod_idx, module in enumerate(modules):
+        mod_state = ema_state.get(f"module_{mod_idx}", {})
+        for name, param in module.named_parameters():
+            if name in mod_state:
+                ema_params.append(mod_state[name].to(device))
+            else:
+                # Fallback to current parameter if not in state
+                ema_params.append(param.data.clone().detach())
+    return ema_params

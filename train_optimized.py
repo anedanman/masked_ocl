@@ -13,7 +13,7 @@ Key changes from original train.py:
 import os
 import math
 import argparse
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -105,7 +105,11 @@ def maybe_compile_optimized(module: nn.Module, cfg: Dict[str, Any]) -> nn.Module
         return module
 
 
-def prepare_dataloaders(cfg: Dict[str, Any]) -> Dict[str, torch.utils.data.DataLoader]:
+def prepare_dataloaders(
+    cfg: Dict[str, Any],
+    *,
+    out_dir: Optional[str] = None,
+) -> Dict[str, torch.utils.data.DataLoader]:
     """Select and construct dataloaders based on dataset configuration."""
     data_cfg = cfg.get("data", {})
     train_cfg = cfg.get("train", {})
@@ -120,6 +124,49 @@ def prepare_dataloaders(cfg: Dict[str, Any]) -> Dict[str, torch.utils.data.DataL
     train_num_workers = int(train_cfg.get("num_workers", 4))
     val_num_workers = int(train_cfg.get("val_num_workers", train_num_workers))
     test_num_workers = int(train_cfg.get("test_num_workers", val_num_workers))
+
+    train_pin_memory = bool(train_cfg.get("pin_memory", True))
+    train_persistent_workers = train_cfg.get("persistent_workers", None)
+    if train_persistent_workers is not None:
+        train_persistent_workers = bool(train_persistent_workers)
+    train_prefetch_factor = train_cfg.get("prefetch_factor", 2)
+    if train_prefetch_factor is not None:
+        train_prefetch_factor = int(train_prefetch_factor)
+        if train_prefetch_factor <= 0:
+            train_prefetch_factor = None
+
+    cache_cfg = train_cfg.get("dino_cache", cfg.get("dino_cache", {})) or {}
+    train_cache_backend = str(cache_cfg.get("backend", "files")).lower()
+    if train_cache_backend not in ("files", "lmdb"):
+        raise ValueError(
+            f"Unsupported dino_cache.backend '{train_cache_backend}'. Expected 'files' or 'lmdb'."
+        )
+    train_skip_image_loading = bool(cache_cfg.get("skip_image_loading", False))
+    train_cache_dir = None
+    if cache_cfg.get("enabled", False) and train_skip_image_loading:
+        cache_root = cache_cfg.get("dir")
+        if cache_root is None and out_dir is not None:
+            cache_root = os.path.join(out_dir, "dino_cache")
+        if cache_root is not None:
+            init_mode = cfg.get("slots", {}).get("init_mode", "gaussian")
+            need_cls_token = init_mode == "gaussian_pred"
+            store_cls_token = bool(cache_cfg.get("store_cls_token", need_cls_token))
+            if train_cfg.get("amp", True):
+                amp_label = str(train_cfg.get("amp_dtype", "amp")).lower()
+            else:
+                amp_label = "fp32"
+            cache_version = cache_cfg.get("version")
+            if cache_version is None:
+                dataset_name = data_cfg.get("dataset", "dataset")
+                image_size = data_cfg.get("image_size", "unknown")
+                dino_size = cfg.get("dino", {}).get("size", "unknown")
+                cache_version = (
+                    f"{dataset_name}_dino{dino_size}_img{image_size}_{amp_label}_cls{int(store_cls_token)}"
+                )
+            if train_cache_backend == "lmdb":
+                train_cache_dir = os.path.join(cache_root, cache_version, "lmdb")
+            else:
+                train_cache_dir = os.path.join(cache_root, cache_version)
 
     if dataset_type == "coco":
         return get_coco_dataloaders(
@@ -141,6 +188,12 @@ def prepare_dataloaders(cfg: Dict[str, Any]) -> Dict[str, torch.utils.data.DataL
             val_return_masks=True,
             train_horizontal_flip_prob=data_cfg.get("train_horizontal_flip_prob", 0.5),
             val_horizontal_flip_prob=data_cfg.get("val_horizontal_flip_prob", 0.0),
+            train_pin_memory=train_pin_memory,
+            train_persistent_workers=train_persistent_workers,
+            train_prefetch_factor=train_prefetch_factor,
+            train_cache_dir=train_cache_dir,
+            train_skip_image_loading=train_skip_image_loading,
+            train_cache_backend=train_cache_backend,
         )
     elif dataset_type == "clevrtex":
         split_cfg = data_cfg.get("split", {})
@@ -162,6 +215,12 @@ def prepare_dataloaders(cfg: Dict[str, Any]) -> Dict[str, torch.utils.data.DataL
             test_ratio=split_cfg.get("test", 0.15),
             seed=split_cfg.get("seed", 42),
             train_return_masks=train_return_masks,
+            train_pin_memory=train_pin_memory,
+            train_persistent_workers=train_persistent_workers,
+            train_prefetch_factor=train_prefetch_factor,
+            train_cache_dir=train_cache_dir,
+            train_skip_image_loading=train_skip_image_loading,
+            train_cache_backend=train_cache_backend,
         )
     else:
         raise ValueError(f"Unsupported dataset type '{dataset_type}'. Expected 'coco' or 'clevrtex'.")
@@ -191,7 +250,7 @@ def main():
         torch.backends.cudnn.benchmark = not deterministic_mode
 
     # Dataloaders
-    loaders = prepare_dataloaders(cfg)
+    loaders = prepare_dataloaders(cfg, out_dir=out_dir)
     train_loader = loaders["train"]
     val_loader = loaders["val"]
 

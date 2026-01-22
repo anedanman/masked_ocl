@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -8,6 +9,14 @@ from typing import Tuple, Dict, List, Optional, Union, Any
 import torchvision
 from torchvision.transforms import v2
 import torchvision.transforms.functional as TF
+
+try:
+    import lmdb
+
+    _LMDB_AVAILABLE = True
+except Exception:
+    lmdb = None
+    _LMDB_AVAILABLE = False
 
 
 def make_transform(resize_size: int = 256, crop: bool = False):
@@ -158,6 +167,9 @@ class CLEVRTEXDataset(Dataset):
         return_properties: bool = True,
         return_masks: bool = True,
         samples: Optional[List[Dict[str, Any]]] = None,
+        cache_dir: Optional[str] = None,
+        skip_image_loading: bool = False,
+        cache_backend: str = "files",
     ):
         """
         Args:
@@ -175,6 +187,10 @@ class CLEVRTEXDataset(Dataset):
         self.image_size = image_size
         self.return_properties = return_properties
         self.return_masks = return_masks
+        self.cache_dir = cache_dir
+        self.skip_image_loading = bool(skip_image_loading) and cache_dir is not None
+        self.cache_backend = str(cache_backend).lower()
+        self._lmdb_env = None
         if self.return_properties and not self.return_masks:
             raise ValueError("Cannot return properties when masks are disabled.")
         
@@ -216,9 +232,63 @@ class CLEVRTEXDataset(Dataset):
                 
                 if max_samples and len(self.samples) >= max_samples:
                     break
-    
+
     def __len__(self) -> int:
         return len(self.samples)
+
+    def _cache_path(self, cache_key: str) -> Optional[str]:
+        if self.cache_dir is None:
+            return None
+        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
+        return os.path.join(self.cache_dir, digest[:2], f"{digest[2:]}.pt")
+
+    def _get_lmdb_env(self):
+        if not _LMDB_AVAILABLE:
+            raise ImportError("lmdb is required for cache_backend='lmdb'. Install with `pip install lmdb`.")
+        if self._lmdb_env is None:
+            try:
+                self._lmdb_env = lmdb.open(
+                    self.cache_dir,
+                    readonly=True,
+                    lock=False,
+                    readahead=False,
+                    meminit=False,
+                    max_readers=126,
+                )
+            except Exception:
+                return None
+        return self._lmdb_env
+
+    def _refresh_lmdb_env(self) -> None:
+        if self._lmdb_env is not None:
+            try:
+                self._lmdb_env.close()
+            except Exception:
+                pass
+        self._lmdb_env = None
+
+    def _cache_has_key(self, cache_key: str) -> bool:
+        if self.cache_dir is None:
+            return False
+        if self.cache_backend == "files":
+            cache_path = self._cache_path(cache_key)
+            return cache_path is not None and os.path.exists(cache_path)
+        if self.cache_backend == "lmdb":
+            env = self._get_lmdb_env()
+            if env is None:
+                return False
+            key_bytes = cache_key.encode("utf-8")
+            try:
+                with env.begin(write=False) as txn:
+                    return txn.get(key_bytes) is not None
+            except lmdb.MapResizedError:
+                self._refresh_lmdb_env()
+                env = self._get_lmdb_env()
+                if env is None:
+                    return False
+                with env.begin(write=False) as txn:
+                    return txn.get(key_bytes) is not None
+        return False
     
     def _load_image(self, scene_dir: str, filename_base: str) -> torch.Tensor:
         """Load and transform image using torchvision v2."""
@@ -309,12 +379,18 @@ class CLEVRTEXDataset(Dataset):
         with open(sample['json_path'], 'r') as f:
             scene = json.load(f)
         
-        # Load image
-        image = self._load_image(sample['scene_dir'], scene['image_filename'])
+        cache_key = f"clevrtex/{self.variant}/{sample['scene_name']}"
+        image = None
+        if self.skip_image_loading and self._cache_has_key(cache_key):
+            image = torch.zeros(3, self.image_size, self.image_size, dtype=torch.float32)
+
+        if image is None:
+            image = self._load_image(sample['scene_dir'], scene['image_filename'])
         
         output: Dict[str, torch.Tensor] = {
             'image': image,
-            'image_id': torch.tensor(idx)
+            'image_id': torch.tensor(idx),
+            'cache_key': cache_key,
         }
         
         if self.return_masks:
@@ -362,6 +438,9 @@ class COCODataset(Dataset):
         return_properties: bool = True,
         return_masks: bool = True,
         horizontal_flip_prob: float = 0.0,
+        cache_dir: Optional[str] = None,
+        skip_image_loading: bool = False,
+        cache_backend: str = "files",
     ) -> None:
         super().__init__()
         if mode not in {"instance", "class"}:
@@ -380,6 +459,10 @@ class COCODataset(Dataset):
         self.min_area = float(min_area)
         self.return_properties = return_properties
         self.return_masks = return_masks
+        self.cache_dir = cache_dir
+        self.skip_image_loading = bool(skip_image_loading) and cache_dir is not None
+        self.cache_backend = str(cache_backend).lower()
+        self._lmdb_env = None
         if self.return_properties and not self.return_masks:
             raise ValueError("Cannot return properties when masks are disabled.")
         self.horizontal_flip_prob = float(horizontal_flip_prob)
@@ -434,6 +517,60 @@ class COCODataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def _cache_path(self, cache_key: str) -> Optional[str]:
+        if self.cache_dir is None:
+            return None
+        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
+        return os.path.join(self.cache_dir, digest[:2], f"{digest[2:]}.pt")
+
+    def _get_lmdb_env(self):
+        if not _LMDB_AVAILABLE:
+            raise ImportError("lmdb is required for cache_backend='lmdb'. Install with `pip install lmdb`.")
+        if self._lmdb_env is None:
+            try:
+                self._lmdb_env = lmdb.open(
+                    self.cache_dir,
+                    readonly=True,
+                    lock=False,
+                    readahead=False,
+                    meminit=False,
+                    max_readers=126,
+                )
+            except Exception:
+                return None
+        return self._lmdb_env
+
+    def _refresh_lmdb_env(self) -> None:
+        if self._lmdb_env is not None:
+            try:
+                self._lmdb_env.close()
+            except Exception:
+                pass
+        self._lmdb_env = None
+
+    def _cache_has_key(self, cache_key: str) -> bool:
+        if self.cache_dir is None:
+            return False
+        if self.cache_backend == "files":
+            cache_path = self._cache_path(cache_key)
+            return cache_path is not None and os.path.exists(cache_path)
+        if self.cache_backend == "lmdb":
+            env = self._get_lmdb_env()
+            if env is None:
+                return False
+            key_bytes = cache_key.encode("utf-8")
+            try:
+                with env.begin(write=False) as txn:
+                    return txn.get(key_bytes) is not None
+            except lmdb.MapResizedError:
+                self._refresh_lmdb_env()
+                env = self._get_lmdb_env()
+                if env is None:
+                    return False
+                with env.begin(write=False) as txn:
+                    return txn.get(key_bytes) is not None
+        return False
 
     def _load_image(self, sample: Dict[str, Any], horizontal_flip: bool = False) -> torch.Tensor:
         img_path = os.path.join(self.image_dir, sample["image_file"])
@@ -561,12 +698,20 @@ class COCODataset(Dataset):
         do_hflip = False
         if self.horizontal_flip_prob > 0.0:
             do_hflip = bool(torch.rand(1).item() < self.horizontal_flip_prob)
-        image = self._load_image(sample, horizontal_flip=do_hflip)
+        cache_key = f"coco/{self.split}/{sample['image_file']}"
+        if do_hflip:
+            cache_key = f"{cache_key}|hflip"
+        image = None
+        if self.skip_image_loading and self._cache_has_key(cache_key):
+            image = torch.zeros(3, self.image_size, self.image_size, dtype=torch.float32)
+        if image is None:
+            image = self._load_image(sample, horizontal_flip=do_hflip)
 
         output: Dict[str, torch.Tensor] = {
             "image": image,
             "image_id": torch.tensor(sample["image_id"]),
         }
+        output["cache_key"] = cache_key
 
         if not self.return_masks:
             return output
@@ -685,6 +830,12 @@ def get_coco_dataloaders(
     val_return_masks: bool = True,
     train_horizontal_flip_prob: float = 0.5,
     val_horizontal_flip_prob: float = 0.0,
+    train_pin_memory: bool = True,
+    train_persistent_workers: Optional[bool] = None,
+    train_prefetch_factor: Optional[int] = 2,
+    train_cache_dir: Optional[str] = None,
+    train_skip_image_loading: bool = False,
+    train_cache_backend: str = "files",
 ) -> Dict[str, torch.utils.data.DataLoader]:
     """
     Create COCO dataloaders for train and validation using panoptic annotations.
@@ -724,6 +875,9 @@ def get_coco_dataloaders(
         return_properties=return_properties and train_return_masks,
         return_masks=train_return_masks,
         horizontal_flip_prob=train_horizontal_flip_prob,
+        cache_dir=train_cache_dir,
+        skip_image_loading=train_skip_image_loading,
+        cache_backend=train_cache_backend,
     )
 
     val_dataset = COCODataset(
@@ -745,9 +899,13 @@ def get_coco_dataloaders(
             batch_size=train_batch_size,
             shuffle=True,
             num_workers=train_num_workers,
-            pin_memory=True,
-            persistent_workers=True if train_num_workers > 0 else False,
-            prefetch_factor=2 if train_num_workers > 0 else None,
+            pin_memory=bool(train_pin_memory),
+            persistent_workers=(
+                train_persistent_workers if train_persistent_workers is not None else train_num_workers > 0
+            ),
+            prefetch_factor=(
+                train_prefetch_factor if train_num_workers > 0 else None
+            ),
         ),
         "val": torch.utils.data.DataLoader(
             val_dataset,
@@ -783,6 +941,12 @@ def get_clevrtex_dataloaders(
     train_return_masks: bool = True,
     val_return_masks: bool = True,
     test_return_masks: bool = True,
+    train_pin_memory: bool = True,
+    train_persistent_workers: Optional[bool] = None,
+    train_prefetch_factor: Optional[int] = 2,
+    train_cache_dir: Optional[str] = None,
+    train_skip_image_loading: bool = False,
+    train_cache_backend: str = "files",
 ) -> Dict[str, torch.utils.data.DataLoader]:
     """
     Create CLEVRTEX dataloaders with train/val/test splits.
@@ -841,7 +1005,14 @@ def get_clevrtex_dataloaders(
     val_samples = [full_dataset.samples[i] for i in val_indices]
     test_samples = [full_dataset.samples[i] for i in test_indices]
 
-    def build_dataset(sample_list: List[Dict[str, Any]], return_masks: bool) -> CLEVRTEXDataset:
+    def build_dataset(
+        sample_list: List[Dict[str, Any]],
+        return_masks: bool,
+        *,
+        cache_dir: Optional[str] = None,
+        skip_image_loading: bool = False,
+        cache_backend: str = "files",
+    ) -> CLEVRTEXDataset:
         return CLEVRTEXDataset(
             data_root=data_root,
             variant=variant,
@@ -851,6 +1022,9 @@ def get_clevrtex_dataloaders(
             return_properties=return_properties and return_masks,
             return_masks=return_masks,
             samples=sample_list,
+            cache_dir=cache_dir,
+            skip_image_loading=skip_image_loading,
+            cache_backend=cache_backend,
         )
 
     if val_batch_size is None:
@@ -862,7 +1036,13 @@ def get_clevrtex_dataloaders(
     if test_num_workers is None:
         test_num_workers = val_num_workers
 
-    train_dataset = build_dataset(train_samples, train_return_masks)
+    train_dataset = build_dataset(
+        train_samples,
+        train_return_masks,
+        cache_dir=train_cache_dir,
+        skip_image_loading=train_skip_image_loading,
+        cache_backend=train_cache_backend,
+    )
     val_dataset = build_dataset(val_samples, val_return_masks)
     test_dataset = build_dataset(test_samples, test_return_masks)
     
@@ -873,9 +1053,13 @@ def get_clevrtex_dataloaders(
             batch_size=train_batch_size,
             shuffle=True,
             num_workers=train_num_workers,
-            pin_memory=True,
-            persistent_workers=True if train_num_workers > 0 else False,
-            prefetch_factor=2 if train_num_workers > 0 else None,
+            pin_memory=bool(train_pin_memory),
+            persistent_workers=(
+                train_persistent_workers if train_persistent_workers is not None else train_num_workers > 0
+            ),
+            prefetch_factor=(
+                train_prefetch_factor if train_num_workers > 0 else None
+            ),
         ),
         'val': torch.utils.data.DataLoader(
             val_dataset,
