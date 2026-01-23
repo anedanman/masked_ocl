@@ -112,6 +112,7 @@ class _MARDecoderBlock(nn.Module):
         mlp_hidden_dim: int,
         dropout: float = 0.0,
         qk_norm: bool = True,
+        slot_cross_mlp: bool = False,
     ) -> None:
         super().__init__()
         self.self_ln = nn.LayerNorm(dim)
@@ -142,6 +143,17 @@ class _MARDecoderBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim),
             nn.Dropout(dropout),
         )
+        self.slot_ln = None
+        self.slot_mlp = None
+        if slot_cross_mlp:
+            self.slot_ln = nn.LayerNorm(dim)
+            self.slot_mlp = nn.Sequential(
+                nn.Linear(dim, mlp_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(mlp_hidden_dim, dim),
+                nn.Dropout(dropout),
+            )
 
     def forward(
         self,
@@ -164,10 +176,13 @@ class _MARDecoderBlock(nn.Module):
         tokens = tokens + self.self_drop(self_out)
 
         h = self.cross_ln(tokens)
+        slots_kv = slots
+        if self.slot_mlp is not None and self.slot_ln is not None:
+            slots_kv = slots + self.slot_mlp(self.slot_ln(slots))
         cross_out, cross_weights = self.cross_attn(
             h,
-            slots,
-            slots,
+            slots_kv,
+            slots_kv,
             need_weights=need_weights,
             average_attn_weights=False,
         )
@@ -215,6 +230,7 @@ class SlotMARDecoder(nn.Module):
         max_seq_len: int = 256,
         eps: float = 1e-6,
         use_torch_sampling: bool = True,
+        slot_cross_mlp: bool = False,
     ) -> None:
         super().__init__()
         model_dim = model_dim or slot_size
@@ -284,6 +300,7 @@ class SlotMARDecoder(nn.Module):
         if self.pos_embed_type not in ("learned", "mlp"):
             raise ValueError("pos_embed_type must be 'learned' or 'mlp'.")
         self.max_seq_len = int(max_seq_len)
+        self.slot_cross_mlp = bool(slot_cross_mlp)
 
         mlp_hidden_dim = mlp_hidden_dim or (4 * model_dim)
 
@@ -360,6 +377,7 @@ class SlotMARDecoder(nn.Module):
                 mlp_hidden_dim=mlp_hidden_dim,
                 dropout=dropout,
                 qk_norm=use_qk_norm,
+                slot_cross_mlp=self.slot_cross_mlp,
             )
             for _ in range(self.decoder_depth)
         ])

@@ -718,6 +718,7 @@ def build_slot_mar_components(cfg: Dict[str, Any], device: torch.device):
         pos_embed_type=str(mar_cfg.get("pos_embed_type", "learned")),
         max_seq_len=int(mar_cfg.get("max_seq_len", 256)),
         use_torch_sampling=bool(mar_cfg.get("use_torch_sampling", True)),
+        slot_cross_mlp=bool(mar_cfg.get("slot_cross_mlp", False)),
     ).to(device)
 
     return dino, slot_attn, decoder, feat_dim
