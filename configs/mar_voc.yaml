@@ -1,5 +1,5 @@
 train:
-  max_updates: 200002
+  max_updates: 150002
   val_every_updates: 10000
   log_every_updates: 500
   val_iterative: false
@@ -18,10 +18,13 @@ train:
   gradient_accumulation_steps: 1
   num_workers: 16
   val_num_workers: 4
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
   images_only: true
   return_properties: false
   max_samples_train: null
-  max_samples_val: 2000
+  max_samples_val: null
   max_val_batches: 20
   grad_clip_norm: 1.0
   learning_rate: 3.0e-4
@@ -38,16 +41,18 @@ train:
     every_updates: 10000
     keep_last: 1
     resume_path: null
-    resume_latest: true
+    resume_latest: false
+  amp: true
+  amp_dtype: "bfloat16"
+
 
 data:
-  dataset: coco
-  root: ./data/coco
+  dataset: voc
+  root: ./data/voc/VOCdevkit/VOC2012
   image_size: 256
-  max_objects: 60
-  train_split: train2017
-  val_split: val2017
-  min_area: 0.0
+  max_objects: 20
+  train_split: trainaug
+  val_split: val
   train_horizontal_flip_prob: 0.5
 
 dino:
@@ -57,7 +62,7 @@ dino:
 
 slots:
   num_iterations: 5
-  num_slots: 7
+  num_slots: 6
   num_heads: 1
   slot_size: 512
   input_size: null
@@ -72,12 +77,13 @@ slots:
 
 mar:
   model_dim: 768
-  encoder_depth: 2
+  encoder_depth: 0
   decoder_depth: 4
   num_heads: 6
   mlp_hidden_dim: 3072
+  slot_cross_mlp: false
   dropout: 0.0
-  self_attn_type: full # 'full' or 'causal'
+  self_attn_type: full
   prediction_order: random
   predict_tokens: null
   buffer_size: 64
@@ -90,20 +96,20 @@ mar:
   add_pos_to_known: false
   qk_norm: false
   use_bos_token: true
-  pos_embed_type: mlp  # 'learned' (like original MAR) or 'mlp'
-  max_seq_len: 256  # max sequence length for learned positional embeddings
+  pos_embed_type: mlp
+  max_seq_len: 256
 
 masking:
-  strategy: order  # 'order' or 'slot_conditioned'
+  strategy: order
   ratio_min: 0.7
   ratio_max: 1.0
-  ratio_mode: uniform  # 'truncated_gaussian' (like original MAR) or 'uniform'
-  ratio_std: 0.25  # std dev for truncated Gaussian (centered at ratio_max)
+  ratio_mode: uniform
+  ratio_std: 0.25
 
 mask_matching:
   enabled: true
   lambda_start: 0.0
-  lambda_end: 0.025
+  lambda_end: 0.1
   lambda_warmup_steps: 0
   lambda_ramp_steps: 40000
 
@@ -111,7 +117,7 @@ wandb:
   enabled: true
   project: slot-dino
   entity: null
-  run_name: mar_coco_mask0.7_1.0_Bdino_mlppos_registerslots_maskmatch_noslotcond
+  run_name: mar_voc
   mode: online
 
 output:

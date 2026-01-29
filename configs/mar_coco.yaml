@@ -1,5 +1,5 @@
 train:
-  max_updates: 200002
+  max_updates: 150002
   val_every_updates: 10000
   log_every_updates: 500
   val_iterative: false
@@ -18,7 +18,7 @@ train:
   gradient_accumulation_steps: 1
   num_workers: 16
   val_num_workers: 4
-  prefetch_factor: 8
+  prefetch_factor: 4
   pin_memory: true
   persistent_workers: true
   images_only: true
@@ -70,10 +70,10 @@ slots:
   num_iterations: 5
   num_slots: 7
   num_heads: 1
-  slot_size: 768
+  slot_size: 512
   input_size: null
   out_size: null
-  mlp_hidden_size: 3072
+  mlp_hidden_size: 2048
   truncate: fixed-point
   qk_rmsnorm: false
   qk_rmsnorm_eps: 1.0e-6
@@ -83,10 +83,11 @@ slots:
 
 mar:
   model_dim: 768
-  encoder_depth: 2
+  encoder_depth: 0
   decoder_depth: 4
   num_heads: 6
   mlp_hidden_dim: 3072
+  slot_cross_mlp: false
   dropout: 0.0
   self_attn_type: full # 'full' or 'causal'
   prediction_order: random
@@ -120,9 +121,9 @@ mask_matching:
 
 wandb:
   enabled: true
-  project: slot-dino
+  project: slot-mar
   entity: null
-  run_name: mar_coco_mask0.7_1.0_Bdino_mlppos_registerslots_maskmatch_biggerslots
+  run_name: mar_coco_B
   mode: online
 
 output:
