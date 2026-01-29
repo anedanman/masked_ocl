@@ -113,8 +113,10 @@ class _MARDecoderBlock(nn.Module):
         dropout: float = 0.0,
         qk_norm: bool = True,
         slot_cross_mlp: bool = False,
+        slot_cross_mlp_skip: bool = True,
     ) -> None:
         super().__init__()
+        self.slot_cross_mlp_skip = bool(slot_cross_mlp_skip)
         self.self_ln = nn.LayerNorm(dim)
         self.self_attn = QKNormalizedMultiheadAttention(
             embed_dim=dim,
@@ -178,7 +180,8 @@ class _MARDecoderBlock(nn.Module):
         h = self.cross_ln(tokens)
         slots_kv = slots
         if self.slot_mlp is not None and self.slot_ln is not None:
-            slots_kv = slots + self.slot_mlp(self.slot_ln(slots))
+            slot_update = self.slot_mlp(self.slot_ln(slots))
+            slots_kv = slots + slot_update if self.slot_cross_mlp_skip else slot_update
         cross_out, cross_weights = self.cross_attn(
             h,
             slots_kv,
@@ -231,6 +234,7 @@ class SlotMARDecoder(nn.Module):
         eps: float = 1e-6,
         use_torch_sampling: bool = True,
         slot_cross_mlp: bool = False,
+        slot_cross_mlp_skip: bool = True,
     ) -> None:
         super().__init__()
         model_dim = model_dim or slot_size
@@ -301,6 +305,7 @@ class SlotMARDecoder(nn.Module):
             raise ValueError("pos_embed_type must be 'learned' or 'mlp'.")
         self.max_seq_len = int(max_seq_len)
         self.slot_cross_mlp = bool(slot_cross_mlp)
+        self.slot_cross_mlp_skip = bool(slot_cross_mlp_skip)
 
         mlp_hidden_dim = mlp_hidden_dim or (4 * model_dim)
 
@@ -378,6 +383,7 @@ class SlotMARDecoder(nn.Module):
                 dropout=dropout,
                 qk_norm=use_qk_norm,
                 slot_cross_mlp=self.slot_cross_mlp,
+                slot_cross_mlp_skip=self.slot_cross_mlp_skip,
             )
             for _ in range(self.decoder_depth)
         ])
@@ -934,9 +940,14 @@ class SlotMARDecoder(nn.Module):
         teacher_force: bool = False,
         parallel_teacher_force: bool = False,
         return_decoder_masks: bool = False,
+        decoder_mask_aggregation: str = "pred_only",
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if num_steps <= 0:
             raise ValueError("num_steps must be positive.")
+        if return_decoder_masks and decoder_mask_aggregation not in ("pred_only", "mean_all"):
+            raise ValueError(
+                "decoder_mask_aggregation must be 'pred_only' or 'mean_all' when return_decoder_masks=True."
+            )
         height, width = _normalize_hw(feats)
         tokens = rearrange(feats, "b c h w -> b (h w) c")
         bsz, num_tokens, feat_dim = tokens.shape
@@ -1062,9 +1073,15 @@ class SlotMARDecoder(nn.Module):
 
             current_tokens = torch.zeros(bsz, num_tokens, feat_dim, device=device, dtype=dtype)
             if return_decoder_masks:
-                final_decoder_masks = torch.zeros(
-                    bsz, slots.shape[1], num_tokens, device=device, dtype=dtype
-                )
+                if decoder_mask_aggregation == "mean_all":
+                    mask_accum = torch.zeros(
+                        bsz, slots.shape[1], num_tokens, device=device, dtype=dtype
+                    )
+                    mask_accum_count = 0
+                else:
+                    final_decoder_masks = torch.zeros(
+                        bsz, slots.shape[1], num_tokens, device=device, dtype=dtype
+                    )
 
             for step in range(num_steps):
                 pred_idx = pred_indices_steps[step]
@@ -1077,17 +1094,31 @@ class SlotMARDecoder(nn.Module):
 
                 if return_decoder_masks and decoder_masks is not None:
                     step_masks = decoder_masks[step].squeeze(2).view(bsz, -1, num_tokens)
-                    fill_flat = torch.zeros(bsz, num_tokens, device=device, dtype=torch.bool)
-                    fill_flat.scatter_(1, pred_idx, True)
-                    final_decoder_masks = torch.where(
-                        fill_flat.unsqueeze(1), step_masks, final_decoder_masks
-                    )
+                    if decoder_mask_aggregation == "mean_all":
+                        mask_accum = mask_accum + step_masks
+                        mask_accum_count += 1
+                    else:
+                        fill_flat = torch.zeros(bsz, num_tokens, device=device, dtype=torch.bool)
+                        fill_flat.scatter_(1, pred_idx, True)
+                        final_decoder_masks = torch.where(
+                            fill_flat.unsqueeze(1), step_masks, final_decoder_masks
+                        )
 
             recon = rearrange(current_tokens, "b (h w) c -> b c h w", h=height, w=width)
             if return_decoder_masks:
+                if decoder_mask_aggregation == "mean_all":
+                    if mask_accum_count > 0:
+                        final_decoder_masks = mask_accum / float(mask_accum_count)
+                    else:
+                        final_decoder_masks = torch.zeros(
+                            bsz, slots.shape[1], num_tokens, device=device, dtype=dtype
+                        )
                 final_decoder_masks = final_decoder_masks.view(bsz, -1, height, width).unsqueeze(2)
                 return recon, final_decoder_masks
             return recon
+
+        if return_decoder_masks and decoder_mask_aggregation == "mean_all":
+            mask_accum_count = 0
 
         for step in range(num_steps):
             remaining = int(mask.sum(dim=1).max().item())
@@ -1124,13 +1155,20 @@ class SlotMARDecoder(nn.Module):
 
             if return_decoder_masks and output.decoder_masks is not None:
                 step_masks = output.decoder_masks.squeeze(2).view(bsz, -1, num_tokens)
-                if final_decoder_masks is None:
-                    final_decoder_masks = torch.zeros_like(step_masks)
-                fill_flat = torch.zeros(bsz, num_tokens, device=device, dtype=torch.bool)
-                fill_flat.scatter_(1, output.pred_indices, True)
-                final_decoder_masks = torch.where(
-                    fill_flat.unsqueeze(1), step_masks, final_decoder_masks
-                )
+                if decoder_mask_aggregation == "mean_all":
+                    if final_decoder_masks is None:
+                        final_decoder_masks = torch.zeros_like(step_masks)
+                        mask_accum_count = 0
+                    final_decoder_masks = final_decoder_masks + step_masks
+                    mask_accum_count += 1
+                else:
+                    if final_decoder_masks is None:
+                        final_decoder_masks = torch.zeros_like(step_masks)
+                    fill_flat = torch.zeros(bsz, num_tokens, device=device, dtype=torch.bool)
+                    fill_flat.scatter_(1, output.pred_indices, True)
+                    final_decoder_masks = torch.where(
+                        fill_flat.unsqueeze(1), step_masks, final_decoder_masks
+                    )
             mask = mask_next
 
         recon = rearrange(current_tokens, "b (h w) c -> b c h w", h=height, w=width)
@@ -1139,6 +1177,8 @@ class SlotMARDecoder(nn.Module):
                 final_decoder_masks = torch.zeros(
                     bsz, slots.shape[1], num_tokens, device=device, dtype=recon.dtype
                 )
+            elif decoder_mask_aggregation == "mean_all":
+                final_decoder_masks = final_decoder_masks / float(mask_accum_count) if mask_accum_count > 0 else final_decoder_masks
             final_decoder_masks = final_decoder_masks.view(bsz, -1, height, width).unsqueeze(2)
             return recon, final_decoder_masks
         return recon

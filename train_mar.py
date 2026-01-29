@@ -1,12 +1,9 @@
 import argparse
-import hashlib
-import io
-import json
 import logging
 import math
 import os
 import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 # Suppress verbose torch.compile logs (set before torch import for full effect)
 logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
@@ -43,14 +40,6 @@ try:
 except Exception:
     torchvision = None
     _TORCHVISION_AVAILABLE = False
-
-try:
-    import lmdb
-
-    _LMDB_AVAILABLE = True
-except Exception:
-    lmdb = None
-    _LMDB_AVAILABLE = False
 
 from src.training import (
     add_background_channel,
@@ -101,290 +90,6 @@ def _linear_ramp_schedule(
     return float(start + (end - start) * progress)
 
 
-class DinoFeatureCache:
-    def __init__(
-        self,
-        root_dir: str,
-        version: str,
-        *,
-        store_cls_token: bool,
-        expected_dtype: Optional[torch.dtype],
-        backend: str = "files",
-        lmdb_map_size_gb: Optional[float] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        self.root_dir = root_dir
-        self.version = version
-        self.store_cls_token = store_cls_token
-        self.expected_dtype = expected_dtype
-        self.backend = str(backend).lower()
-        self.cache_dir = os.path.join(root_dir, version)
-        os.makedirs(self.cache_dir, exist_ok=True)
-        if self.backend not in ("files", "lmdb"):
-            raise ValueError(f"Unsupported cache backend '{self.backend}'. Expected 'files' or 'lmdb'.")
-        self._lmdb_env = None
-        self._lmdb_path = None
-        self._lmdb_map_size = None
-        if self.backend == "lmdb":
-            if not _LMDB_AVAILABLE:
-                raise ImportError("lmdb is required for dino_cache.backend='lmdb'. Install with `pip install lmdb`.")
-            self._lmdb_path = os.path.join(self.cache_dir, "lmdb")
-            os.makedirs(self._lmdb_path, exist_ok=True)
-            if lmdb_map_size_gb is None:
-                lmdb_map_size_gb = 256.0
-            self._lmdb_map_size = int(float(lmdb_map_size_gb) * (1024 ** 3))
-        self._write_metadata(metadata or {})
-
-    def _write_metadata(self, metadata: Dict[str, Any]) -> None:
-        meta_path = os.path.join(self.cache_dir, "cache_meta.json")
-        if os.path.exists(meta_path):
-            return
-        payload = {
-            "version": self.version,
-            "store_cls_token": self.store_cls_token,
-            "expected_dtype": str(self.expected_dtype) if self.expected_dtype is not None else None,
-            "backend": self.backend,
-            "lmdb_map_size_gb": (
-                float(self._lmdb_map_size) / (1024 ** 3)
-                if self._lmdb_map_size is not None
-                else None
-            ),
-        }
-        payload.update(metadata)
-        try:
-            with open(meta_path, "w") as f:
-                json.dump(payload, f, indent=2, sort_keys=True)
-        except Exception:
-            pass
-
-    def _get_lmdb_env(self):
-        if self._lmdb_env is None:
-            if self._lmdb_path is None or self._lmdb_map_size is None:
-                raise RuntimeError("LMDB cache path is not initialized.")
-            self._lmdb_env = lmdb.open(
-                self._lmdb_path,
-                map_size=self._lmdb_map_size,
-                subdir=True,
-                lock=True,
-                readahead=False,
-                meminit=False,
-                max_dbs=1,
-            )
-        return self._lmdb_env
-
-    def _key_to_path(self, key: Any) -> str:
-        key_str = str(key)
-        digest = hashlib.sha1(key_str.encode("utf-8")).hexdigest()
-        subdir = os.path.join(self.cache_dir, digest[:2])
-        return os.path.join(subdir, f"{digest[2:]}.pt")
-
-    def _load_item(self, key: Any, need_cls_token: bool) -> Optional[Dict[str, torch.Tensor]]:
-        if self.backend == "files":
-            path = self._key_to_path(key)
-            if not os.path.isfile(path):
-                return None
-            try:
-                data = torch.load(path, map_location="cpu")
-            except Exception:
-                return None
-        else:
-            env = self._get_lmdb_env()
-            key_bytes = str(key).encode("utf-8")
-            with env.begin(write=False) as txn:
-                raw = txn.get(key_bytes)
-            if raw is None:
-                return None
-            try:
-                buffer = io.BytesIO(raw)
-                data = torch.load(buffer, map_location="cpu")
-            except Exception:
-                return None
-        if not isinstance(data, dict) or "feats" not in data:
-            return None
-        feats = data.get("feats", None)
-        cls_token = data.get("cls_token", None)
-        if feats is None:
-            return None
-        if need_cls_token:
-            if cls_token is None:
-                return None
-        return {"feats": feats, "cls_token": cls_token}
-
-    def _save_item(self, key: Any, feats: torch.Tensor, cls_token: Optional[torch.Tensor]) -> None:
-        payload = {"feats": feats.detach().cpu()}
-        if self.store_cls_token and cls_token is not None:
-            payload["cls_token"] = cls_token.detach().cpu()
-        if self.backend == "files":
-            path = self._key_to_path(key)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp_path = f"{path}.tmp"
-            try:
-                torch.save(payload, tmp_path)
-                os.replace(tmp_path, path)
-            except Exception:
-                try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
-        else:
-            env = self._get_lmdb_env()
-            key_bytes = str(key).encode("utf-8")
-            buffer = io.BytesIO()
-            try:
-                torch.save(payload, buffer)
-                value = buffer.getvalue()
-                try:
-                    with env.begin(write=True) as txn:
-                        txn.put(key_bytes, value)
-                except lmdb.MapFullError:
-                    info = env.info()
-                    current_size = int(info.get("map_size", 0))
-                    grow_by = max(current_size, len(value) * 2)
-                    env.set_mapsize(current_size + grow_by)
-                    with env.begin(write=True) as txn:
-                        txn.put(key_bytes, value)
-            except Exception:
-                pass
-
-    def get_features(
-        self,
-        images: torch.Tensor,
-        keys: Any,
-        dino,
-        *,
-        return_cls_token: bool,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if isinstance(keys, torch.Tensor):
-            key_list = keys.tolist()
-        else:
-            key_list = list(keys)
-        batch_size = len(key_list)
-        if batch_size == 0:
-            raise ValueError("DINO cache received empty batch of keys.")
-
-        cached: List[Optional[Dict[str, torch.Tensor]]] = [None] * batch_size
-        missing_indices: List[int] = []
-        for idx, key in enumerate(key_list):
-            item = self._load_item(key, need_cls_token=return_cls_token)
-            if item is None:
-                missing_indices.append(idx)
-            else:
-                cached[idx] = item
-
-        missing_feats = None
-        missing_cls = None
-        if missing_indices:
-            missing_idx_tensor = torch.tensor(missing_indices, device=images.device)
-            missing_images = images.index_select(0, missing_idx_tensor)
-            if return_cls_token:
-                missing_feats, missing_cls = extract_features(missing_images, dino, return_cls_token=True)
-            else:
-                missing_feats = extract_features(missing_images, dino)
-            for i, idx in enumerate(missing_indices):
-                self._save_item(
-                    key_list[idx],
-                    missing_feats[i],
-                    missing_cls[i] if missing_cls is not None else None,
-                )
-
-        if missing_feats is not None:
-            feats = torch.empty(
-                (batch_size,) + tuple(missing_feats.shape[1:]),
-                device=images.device,
-                dtype=missing_feats.dtype,
-            )
-            feats[missing_idx_tensor] = missing_feats
-            cls_token = None
-            if return_cls_token:
-                if missing_cls is None:
-                    raise RuntimeError("Missing CLS tokens despite return_cls_token=True.")
-                cls_token = torch.empty(
-                    (batch_size,) + tuple(missing_cls.shape[1:]),
-                    device=images.device,
-                    dtype=missing_cls.dtype,
-                )
-                cls_token[missing_idx_tensor] = missing_cls
-            for idx, item in enumerate(cached):
-                if item is None:
-                    continue
-                feat_i = item["feats"].to(device=images.device, dtype=missing_feats.dtype, non_blocking=True)
-                feats[idx] = feat_i
-                if return_cls_token and cls_token is not None:
-                    cls_i = item.get("cls_token")
-                    if cls_i is None:
-                        continue
-                    cls_i = cls_i.to(device=images.device, dtype=missing_cls.dtype, non_blocking=True)
-                    cls_token[idx] = cls_i
-            return feats, cls_token
-
-        feats_list: List[torch.Tensor] = []
-        cls_list: List[torch.Tensor] = []
-        for item in cached:
-            if item is None:
-                raise RuntimeError("DINO cache missing features for all items.")
-            feats_list.append(item["feats"])
-            if return_cls_token:
-                cls_token = item.get("cls_token")
-                if cls_token is None:
-                    raise RuntimeError("DINO cache missing CLS tokens.")
-                cls_list.append(cls_token)
-        target_dtype = feats_list[0].dtype if feats_list else None
-        if target_dtype is None:
-            feats = torch.stack(
-                [t.to(device=images.device, non_blocking=True) for t in feats_list],
-                dim=0,
-            )
-        else:
-            feats = torch.stack(
-                [t.to(device=images.device, dtype=target_dtype, non_blocking=True) for t in feats_list],
-                dim=0,
-            )
-        cls_token_out = None
-        if return_cls_token:
-            if target_dtype is None:
-                cls_token_out = torch.stack(
-                    [t.to(device=images.device, non_blocking=True) for t in cls_list],
-                    dim=0,
-                )
-            else:
-                cls_token_out = torch.stack(
-                    [t.to(device=images.device, dtype=target_dtype, non_blocking=True) for t in cls_list],
-                    dim=0,
-                )
-        return feats, cls_token_out
-
-
-def _maybe_extract_features(
-    images: torch.Tensor,
-    dino,
-    *,
-    cache: Optional[DinoFeatureCache],
-    cache_keys: Optional[Any],
-    return_cls_token: bool,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if cache is None or cache_keys is None:
-        if return_cls_token:
-            feats, cls_token = extract_features(images, dino, return_cls_token=True)
-        else:
-            feats = extract_features(images, dino)
-            cls_token = None
-        return feats, cls_token
-    try:
-        if len(cache_keys) != images.shape[0]:
-            cache_keys = None
-    except TypeError:
-        cache_keys = None
-    if cache_keys is None:
-        if return_cls_token:
-            feats, cls_token = extract_features(images, dino, return_cls_token=True)
-        else:
-            feats = extract_features(images, dino)
-            cls_token = None
-        return feats, cls_token
-    return cache.get_features(images, cache_keys, dino, return_cls_token=return_cls_token)
-
-
 def main():
     parser = argparse.ArgumentParser(description="MAR-style training for slot-based masked prediction.")
     parser.add_argument("--config", type=str, default="configs/dinosaur_coco_mar.yaml", help="Path to YAML config")
@@ -414,7 +119,7 @@ def main():
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = not deterministic_mode
 
-    loaders = prepare_dataloaders(cfg, out_dir=out_dir)
+    loaders = prepare_dataloaders(cfg)
     train_loader = loaders["train"]
     val_loader = loaders["val"]
 
@@ -449,51 +154,7 @@ def main():
     autocast_kwargs = get_autocast_kwargs(device, train_cfg)
     data_cfg = cfg.get("data", {})
 
-    cache_cfg = train_cfg.get("dino_cache", cfg.get("dino_cache", {})) or {}
     log_train_images = bool(cfg.get("wandb", {}).get("log_train_images", True))
-    if cache_cfg.get("skip_image_loading", False) or cache_cfg.get("disable_train_images", False):
-        log_train_images = False
-    cache = None
-    if bool(cache_cfg.get("enabled", False)):
-        if not cfg["dino"].get("freeze", True):
-            print("DINO cache disabled because dino.freeze is false.")
-        else:
-            cache_dir = cache_cfg.get("dir", os.path.join(out_dir, "dino_cache"))
-            store_cls_token = bool(cache_cfg.get("store_cls_token", need_cls_token))
-            cache_backend = cache_cfg.get("backend", "files")
-            lmdb_map_size_gb = cache_cfg.get("lmdb_map_size_gb", None)
-            if autocast_kwargs.get("enabled", False):
-                expected_dtype = autocast_kwargs.get("dtype")
-                amp_label = str(train_cfg.get("amp_dtype", "amp")).lower()
-            else:
-                expected_dtype = torch.float32
-                amp_label = "fp32"
-            cache_version = cache_cfg.get("version")
-            if cache_version is None:
-                dataset_name = data_cfg.get("dataset", "dataset")
-                image_size = data_cfg.get("image_size", "unknown")
-                dino_size = cfg.get("dino", {}).get("size", "unknown")
-                cache_version = f"{dataset_name}_dino{dino_size}_img{image_size}_{amp_label}_cls{int(store_cls_token)}"
-            cache_metadata = {
-                "dataset": data_cfg.get("dataset"),
-                "image_size": data_cfg.get("image_size"),
-                "dino_size": cfg.get("dino", {}).get("size"),
-                "amp_dtype": amp_label,
-                "backend": cache_backend,
-            }
-            cache = DinoFeatureCache(
-                cache_dir,
-                cache_version,
-                store_cls_token=store_cls_token,
-                expected_dtype=expected_dtype,
-                backend=cache_backend,
-                lmdb_map_size_gb=lmdb_map_size_gb,
-                metadata=cache_metadata,
-            )
-            if cache.backend == "lmdb" and cache._lmdb_path is not None:
-                print(f"DINO cache enabled (lmdb) at {cache._lmdb_path}")
-            else:
-                print(f"DINO cache enabled at {cache.cache_dir}")
 
     # EMA configuration
     ema_cfg = train_cfg.get("ema", {})
@@ -561,7 +222,7 @@ def main():
     best_val_metric_step = -1
 
     dataset_type = data_cfg.get("dataset", "coco").lower()
-    semantic_eval_enabled = dataset_type == "coco" and train_cfg.get("eval_semantic_metrics", True)
+    semantic_eval_enabled = dataset_type in ("coco", "voc") and train_cfg.get("eval_semantic_metrics", True)
 
     eval_target_sets: List[str] = ["instance"]
     if semantic_eval_enabled:
@@ -663,20 +324,17 @@ def main():
             gt_masks = batch.get("masks", None)
             if gt_masks is not None:
                 gt_masks = gt_masks.to(device, non_blocking=True)
-            cache_keys = batch.get("cache_key", None)
 
             # Pre-sample mask_ratio outside compiled region to avoid recompilation
             # The decoder's _sample_mask_ratio uses .item() which causes graph breaks
             mask_ratio = decoder._sample_mask_ratio()
 
             with torch.autocast(**autocast_kwargs):
-                feats, cls_token = _maybe_extract_features(
-                    images,
-                    dino,
-                    cache=cache,
-                    cache_keys=cache_keys,
-                    return_cls_token=need_cls_token,
-                )
+                if need_cls_token:
+                    feats, cls_token = extract_features(images, dino, return_cls_token=True)
+                else:
+                    feats = extract_features(images, dino)
+                    cls_token = None
                 B, D, Hf, Wf = feats.shape
 
                 slots, attn_vis, init_loss = slot_attn(feats, cls_token=cls_token)
@@ -842,7 +500,6 @@ def main():
                     if gt_masks is None:
                         continue
                     gt_masks = gt_masks.to(device)
-                    cache_keys = batch.get("cache_key", None)
                     target_sets: Dict[str, torch.Tensor] = {"instance": gt_masks}
                     if semantic_eval_enabled:
                         categories = batch.get("categories", None)
@@ -852,13 +509,11 @@ def main():
                             target_sets["semantic"] = semantic_masks
 
                     with torch.autocast(**autocast_kwargs):
-                        feats, cls_token = _maybe_extract_features(
-                            images,
-                            dino,
-                            cache=cache,
-                            cache_keys=cache_keys,
-                            return_cls_token=need_cls_token,
-                        )
+                        if need_cls_token:
+                            feats, cls_token = extract_features(images, dino, return_cls_token=True)
+                        else:
+                            feats = extract_features(images, dino)
+                            cls_token = None
                         B, D, Hf, Wf = feats.shape
                         slots, attn_vis, _ = slot_attn(feats, cls_token=cls_token)
                         if val_iterative:

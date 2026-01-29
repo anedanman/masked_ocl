@@ -1,10 +1,24 @@
 import numpy as np
-import pydensecrf.densecrf as dcrf
-import pydensecrf.utils as utils
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as VF
-from scipy import ndimage
+
+try:
+    import pydensecrf.densecrf as dcrf
+    import pydensecrf.utils as utils
+
+    _HAS_PYDENSECRF = True
+except Exception:  # pragma: no cover - optional dependency
+    dcrf = None
+    utils = None
+    _HAS_PYDENSECRF = False
+
+from src.evaluation.torch_crf import (
+    CRFParams,
+    crf_refine as torch_crf_refine,
+    crf_refine_batch as torch_crf_refine_batch,
+    dense_crf as torch_dense_crf,
+)
 
 from src.utils import denormalize_image
 
@@ -17,7 +31,18 @@ Bi_RGB_STD = 5
 
 
 
-def dense_crf(image, mask):
+def dense_crf(image, mask, method: str = "pydensecrf", torch_params: CRFParams | None = None):
+    if method != "pydensecrf" or not _HAS_PYDENSECRF:
+        return (
+            torch_dense_crf(
+                torch.from_numpy(image).permute(2, 0, 1),
+                torch.from_numpy(mask),
+                params=torch_params,
+            )
+            .cpu()
+            .numpy()
+        )
+
     h, w = mask.shape
     mask = mask.reshape(1, h, w)
     fg = mask.astype(np.float) 
@@ -50,7 +75,13 @@ def dense_crf(image, mask):
     return MAP
 
 
-def crf_refine(image, masks, denorm_img=True):
+def crf_refine(
+    image,
+    masks,
+    denorm_img: bool = True,
+    method: str = "pydensecrf",
+    torch_params: CRFParams | None = None,
+):
     """
     Refine the masks using dense CRF.
     Args:
@@ -59,6 +90,9 @@ def crf_refine(image, masks, denorm_img=True):
         denorm_img: whether to denormalize the image. Default is True.
     """
     
+    if method != "pydensecrf" or not _HAS_PYDENSECRF:
+        return torch_crf_refine(image, masks, params=torch_params, denorm_img=denorm_img)
+
     # denorm img and convert to np.uint8
     if denorm_img:
         image = denormalize_image(image)
@@ -77,7 +111,13 @@ def crf_refine(image, masks, denorm_img=True):
     refined_masks = torch.from_numpy(Q).float()
     return refined_masks
 
-def crf_refine_batch(images, masks, denorm_img=True):
+def crf_refine_batch(
+    images,
+    masks,
+    denorm_img: bool = True,
+    method: str = "pydensecrf",
+    torch_params: CRFParams | None = None,
+):
     """
     Refine the masks using dense CRF.
     Args:
@@ -85,6 +125,9 @@ def crf_refine_batch(images, masks, denorm_img=True):
         masks: (B, C, H, W), torch tensor, where C is the number of masks. Masks are probs in [0, 1].
         denorm_img: whether to denormalize the image. Default is True.
     """
+    if method != "pydensecrf" or not _HAS_PYDENSECRF:
+        return torch_crf_refine_batch(images, masks, params=torch_params, denorm_img=denorm_img)
+
     B, C, H, W = masks.shape
     refined_masks = []
     for i in range(B):

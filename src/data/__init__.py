@@ -1,15 +1,19 @@
 """Dataset loading and preprocessing."""
 
 from src.data.datasets import (
-    CLEVRTEXDataset,
     COCODataset,
+    VOCDataset,
+    MOViDataset,
     get_coco_dataloaders,
-    get_clevrtex_dataloaders,
+    get_voc_dataloaders,
+    get_movi_dataloaders,
 )
 
 __all__ = [
-    "CLEVRTEXDataset",
     "COCODataset",
+    "VOCDataset",
+    "MOViDataset",
     "get_coco_dataloaders",
-    "get_clevrtex_dataloaders",
+    "get_voc_dataloaders",
+    "get_movi_dataloaders",
 ]

@@ -1,22 +1,12 @@
 import os
-import json
-import hashlib
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from typing import Tuple, Dict, List, Optional, Union, Any
+from typing import Tuple, Dict, List, Optional, Any
 import torchvision
 from torchvision.transforms import v2
 import torchvision.transforms.functional as TF
-
-try:
-    import lmdb
-
-    _LMDB_AVAILABLE = True
-except Exception:
-    lmdb = None
-    _LMDB_AVAILABLE = False
 
 
 def make_transform(resize_size: int = 256, crop: bool = False):
@@ -48,360 +38,6 @@ def make_transform(resize_size: int = 256, crop: bool = False):
     )
     transforms_list.extend([to_float, normalize])
     return v2.Compose(transforms_list)
-
-
-class CLEVRTEXDataset(Dataset):
-    """
-    CLEVRTEX Dataset for object-centric learning.
-    
-    Returns a dictionary in the same style as the COCO dataset implementation:
-        - image: normalized image tensor (C, H, W)
-        - masks: object masks tensor (max_objects, H, W)
-        - image_id: integer id tensor for the sample
-        - properties: one-hot encoded properties (max_objects, property_dim) [optional]
-    """
-    
-    # Property vocabularies
-    SIZES = ['small', 'medium', 'large']
-    SHAPES = ['cube', 'cylinder', 'monkey', 'sphere']
-    
-    # Material vocabularies - all unique materials from CLEVRTEX
-    # 'full' variant has 60 materials, 'outd' variant has 26 materials
-    # Combined unique materials (86 total)
-    MATERIALS = [
-        'ambientcg_acoustic_foam_003',
-        'ambientcg_fence007a',
-        'ambientcg_marble016',
-        'ambientcg_metal003',
-        'ambientcg_tiles032',
-        'ambientcg_tiles035',
-        'cgbookcase_metalweave01_mr',
-        'poly_haven_stony_dirt_path',
-        'polyhaven_aerial_asphalt_01',
-        'polyhaven_aerial_grass_rock',
-        'polyhaven_aerial_mud_1',
-        'polyhaven_aerial_rocks_01',
-        'polyhaven_aerial_sand',
-        'polyhaven_asphalt_02',
-        'polyhaven_bark_willow',
-        'polyhaven_blue_painted_planks',
-        'polyhaven_book_pattern',
-        'polyhaven_brick_floor',
-        'polyhaven_brick_wall_005',
-        'polyhaven_burned_ground_01',
-        'polyhaven_ceramic_roof_01',
-        'polyhaven_coast_sand_rocks_02',
-        'polyhaven_concrete_floor',
-        'polyhaven_concrete_floor_painted',
-        'polyhaven_concrete_rock_path',
-        'polyhaven_coral_fort_wall_02',
-        'polyhaven_cracked_concrete_wall',
-        'polyhaven_dark_wood',
-        'polyhaven_denim_fabric',
-        'polyhaven_dry_ground_rocks',
-        'polyhaven_fabric_pattern_05',
-        'polyhaven_fabric_pattern_07',
-        'polyhaven_factory_brick',
-        'polyhaven_factory_wall',
-        'polyhaven_floor_pattern_02',
-        'polyhaven_floor_tiles_06',
-        'polyhaven_forest_floor',
-        'polyhaven_forest_ground_04',
-        'polyhaven_forrest_ground_01',
-        'polyhaven_garage_floor',
-        'polyhaven_green_metal_rust',
-        'polyhaven_grey_plaster',
-        'polyhaven_grey_roof_tiles',
-        'polyhaven_hexagonal_concrete_paving',
-        'polyhaven_kitchen_wood',
-        'polyhaven_laminate_floor_02',
-        'polyhaven_large_grey_tiles',
-        'polyhaven_large_sandstone_blocks',
-        'polyhaven_leather_red_02',
-        'polyhaven_leaves_forest_ground',
-        'polyhaven_medieval_blocks_02',
-        'polyhaven_metal_plate',
-        'polyhaven_mud_cracked_dry_03',
-        'polyhaven_old_sandstone_02',
-        'polyhaven_painted_metal_shutter',
-        'polyhaven_plank_flooring_02',
-        'polyhaven_preconcrete_wall_001',
-        'polyhaven_raw_plank_wall',
-        'polyhaven_red_brick_plaster_patch_02',
-        'polyhaven_red_laterite_soil_stones',
-        'polyhaven_red_sandstone_wall',
-        'polyhaven_reed_roof_03',
-        'polyhaven_rock_pitted_mossy',
-        'polyhaven_rocky_gravel',
-        'polyhaven_rocky_trail',
-        'polyhaven_roof_07',
-        'polyhaven_roots',
-        'polyhaven_rough_plaster_brick_02',
-        'polyhaven_rough_plaster_broken',
-        'polyhaven_rough_wood',
-        'polyhaven_rust_coarse_01',
-        'polyhaven_rusty_metal',
-        'polyhaven_rusty_metal_02',
-        'polyhaven_slab_tiles',
-        'polyhaven_snow_field_aerial',
-        'polyhaven_square_floor_patern_01',
-        'polyhaven_stone_wall',
-        'polyhaven_weathered_brown_planks',
-        'polyhaven_white_rough_plaster',
-        'polyhaven_white_sandstone_blocks_02',
-        'polyhaven_wood_floor_deck',
-        'polyhaven_wood_peeling_paint_weathered',
-        'polyhaven_wood_plank_wall',
-        'polyhaven_wood_planks_grey',
-        'sharetextures_chainmail_1',
-        'whitemarble',
-    ]
-    
-    def __init__(
-        self,
-        data_root: str,
-        variant: str = 'full',  # 'full' or 'outd'
-        max_objects: int = 10,
-        image_size: int = 256,
-        max_samples: Optional[int] = None,
-        return_properties: bool = True,
-        return_masks: bool = True,
-        samples: Optional[List[Dict[str, Any]]] = None,
-        cache_dir: Optional[str] = None,
-        skip_image_loading: bool = False,
-        cache_backend: str = "files",
-    ):
-        """
-        Args:
-            data_root: Path to clevrtexv2 directory
-            variant: 'full' or 'outd'
-            max_objects: Maximum number of objects to pad to
-            image_size: Target image size (square, will be resized to image_size x image_size)
-            max_samples: Maximum number of samples to load (None for all)
-            return_properties: Whether to return property vectors
-        """
-        super().__init__()
-        self.data_root = data_root
-        self.variant = variant
-        self.max_objects = max_objects
-        self.image_size = image_size
-        self.return_properties = return_properties
-        self.return_masks = return_masks
-        self.cache_dir = cache_dir
-        self.skip_image_loading = bool(skip_image_loading) and cache_dir is not None
-        self.cache_backend = str(cache_backend).lower()
-        self._lmdb_env = None
-        if self.return_properties and not self.return_masks:
-            raise ValueError("Cannot return properties when masks are disabled.")
-        
-        # Create transform pipeline
-        self.transform = make_transform(resize_size=image_size)
-        
-        # Calculate property dimension
-        # [size(3), shape(4), material(86), presence(1)]
-        self.property_dim = len(self.SIZES) + len(self.SHAPES) + len(self.MATERIALS) + 1
-        
-        # Load all scene metadata
-        if samples is not None:
-            self.samples = samples[: max_samples] if max_samples is not None else list(samples)
-        else:
-            self.samples = []
-            base_path = os.path.join(data_root, f'clevrtexv2_{variant}')
-            
-            # Scan all folders
-            for folder in sorted(os.listdir(base_path)):
-                folder_path = os.path.join(base_path, folder)
-                if not os.path.isdir(folder_path):
-                    continue
-                    
-                for scene_dir in sorted(os.listdir(folder_path)):
-                    scene_path = os.path.join(folder_path, scene_dir)
-                    if not os.path.isdir(scene_path):
-                        continue
-                    
-                    json_path = os.path.join(scene_path, f'{scene_dir}.json')
-                    if os.path.exists(json_path):
-                        self.samples.append({
-                            'scene_dir': scene_path,
-                            'scene_name': scene_dir,
-                            'json_path': json_path
-                        })
-                        
-                        if max_samples and len(self.samples) >= max_samples:
-                            break
-                
-                if max_samples and len(self.samples) >= max_samples:
-                    break
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def _cache_path(self, cache_key: str) -> Optional[str]:
-        if self.cache_dir is None:
-            return None
-        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
-        return os.path.join(self.cache_dir, digest[:2], f"{digest[2:]}.pt")
-
-    def _get_lmdb_env(self):
-        if not _LMDB_AVAILABLE:
-            raise ImportError("lmdb is required for cache_backend='lmdb'. Install with `pip install lmdb`.")
-        if self._lmdb_env is None:
-            try:
-                self._lmdb_env = lmdb.open(
-                    self.cache_dir,
-                    readonly=True,
-                    lock=False,
-                    readahead=False,
-                    meminit=False,
-                    max_readers=126,
-                )
-            except Exception:
-                return None
-        return self._lmdb_env
-
-    def _refresh_lmdb_env(self) -> None:
-        if self._lmdb_env is not None:
-            try:
-                self._lmdb_env.close()
-            except Exception:
-                pass
-        self._lmdb_env = None
-
-    def _cache_has_key(self, cache_key: str) -> bool:
-        if self.cache_dir is None:
-            return False
-        if self.cache_backend == "files":
-            cache_path = self._cache_path(cache_key)
-            return cache_path is not None and os.path.exists(cache_path)
-        if self.cache_backend == "lmdb":
-            env = self._get_lmdb_env()
-            if env is None:
-                return False
-            key_bytes = cache_key.encode("utf-8")
-            try:
-                with env.begin(write=False) as txn:
-                    return txn.get(key_bytes) is not None
-            except lmdb.MapResizedError:
-                self._refresh_lmdb_env()
-                env = self._get_lmdb_env()
-                if env is None:
-                    return False
-                with env.begin(write=False) as txn:
-                    return txn.get(key_bytes) is not None
-        return False
-    
-    def _load_image(self, scene_dir: str, filename_base: str) -> torch.Tensor:
-        """Load and transform image using torchvision v2."""
-        # CLEVRTEX images have format: {filename_base}0003.png
-        img_path = os.path.join(scene_dir, f'{filename_base}0003.png')
-        img = Image.open(img_path).convert('RGB')
-        
-        # Apply transforms (resize, convert to tensor, normalize)
-        img_tensor = self.transform(img)
-        
-        return img_tensor
-    
-    def _load_masks(self, scene_dir: str, mask_filename_base: str, num_objects: int) -> torch.Tensor:
-        """Load segmentation masks."""
-        # CLEVRTEX masks have format: {mask_filename_base}_0003.png
-        mask_path = os.path.join(scene_dir, f'{mask_filename_base}_0003.png')
-        mask_img = Image.open(mask_path)
-        
-        # Resize to square if needed
-        if mask_img.size != (self.image_size, self.image_size):
-            mask_img = mask_img.resize((self.image_size, self.image_size), Image.NEAREST)
-        
-        mask_array = np.array(mask_img)
-        
-        # Create one mask per object
-        masks = torch.zeros(self.max_objects, self.image_size, self.image_size)
-        
-        for i in range(num_objects):
-            masks[i] = torch.from_numpy(mask_array == (i)).float()
-    
-        return masks
-    
-    def _encode_properties(self, objects: List[Dict]) -> torch.Tensor:
-        """
-        Encode object properties as one-hot vectors with presence indicator.
-        
-        Property vector structure:
-        [size_onehot(3), shape_onehot(4), material_onehot(86), presence(1)]
-        Total: 94 dimensions
-        """
-        properties = torch.zeros(self.max_objects, self.property_dim)
-        
-        for i, obj in enumerate(objects[:self.max_objects]):
-            offset = 0
-            
-            # Size (3 dimensions)
-            size_idx = self.SIZES.index(obj['size'])
-            properties[i, offset + size_idx] = 1.0
-            offset += len(self.SIZES)
-            
-            # Shape (4 dimensions)
-            shape_idx = self.SHAPES.index(obj['shape'])
-            properties[i, offset + shape_idx] = 1.0
-            offset += len(self.SHAPES)
-            
-            # Material (86 dimensions)
-            material_idx = self.MATERIALS.index(obj['material'])
-            properties[i, offset + material_idx] = 1.0
-            offset += len(self.MATERIALS)
-            
-            # Presence (1 dimension)
-            properties[i, offset] = 1.0
-        
-        return properties
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Returns:
-            Dict containing:
-                - image: (C, H, W) tensor
-                - masks: (max_objects, H, W) or (num_instances, H, W) binary masks
-                - categories: tensor of category ids (padded with -1 when necessary)
-                - num_instances: number of valid masks before padding
-                - areas: normalized areas for each mask
-                - bboxes: normalized bounding boxes [x, y, w, h]
-                - properties: optional property vectors when ``return_properties`` is True
-        """
-        """
-        Returns a dict with keys similar to COCO samples:
-            - image: (C, H, W) normalized image
-            - masks: (max_objects, H, W) object masks
-            - image_id: tensor([idx]) for consistency
-            - properties: (max_objects, property_dim) one-hot properties when enabled
-        """
-        sample = self.samples[idx]
-        
-        # Load scene metadata
-        with open(sample['json_path'], 'r') as f:
-            scene = json.load(f)
-        
-        cache_key = f"clevrtex/{self.variant}/{sample['scene_name']}"
-        image = None
-        if self.skip_image_loading and self._cache_has_key(cache_key):
-            image = torch.zeros(3, self.image_size, self.image_size, dtype=torch.float32)
-
-        if image is None:
-            image = self._load_image(sample['scene_dir'], scene['image_filename'])
-        
-        output: Dict[str, torch.Tensor] = {
-            'image': image,
-            'image_id': torch.tensor(idx),
-            'cache_key': cache_key,
-        }
-        
-        if self.return_masks:
-            masks = self._load_masks(sample['scene_dir'], scene['mask_filename'], scene['num_objects'])
-            output['masks'] = masks
-        
-        if self.return_properties:
-            properties = self._encode_properties(scene['objects'])
-            output['properties'] = properties
-        
-        return output
 
 
 class COCODataset(Dataset):
@@ -437,10 +73,8 @@ class COCODataset(Dataset):
         min_area: float = 0.0,
         return_properties: bool = True,
         return_masks: bool = True,
+        properties_from_bboxes: bool = False,
         horizontal_flip_prob: float = 0.0,
-        cache_dir: Optional[str] = None,
-        skip_image_loading: bool = False,
-        cache_backend: str = "files",
     ) -> None:
         super().__init__()
         if mode not in {"instance", "class"}:
@@ -459,12 +93,9 @@ class COCODataset(Dataset):
         self.min_area = float(min_area)
         self.return_properties = return_properties
         self.return_masks = return_masks
-        self.cache_dir = cache_dir
-        self.skip_image_loading = bool(skip_image_loading) and cache_dir is not None
-        self.cache_backend = str(cache_backend).lower()
-        self._lmdb_env = None
-        if self.return_properties and not self.return_masks:
-            raise ValueError("Cannot return properties when masks are disabled.")
+        self.properties_from_bboxes = bool(properties_from_bboxes)
+        if self.return_properties and not self.return_masks and not self.properties_from_bboxes:
+            raise ValueError("Cannot return properties when masks are disabled (unless properties_from_bboxes=True).")
         self.horizontal_flip_prob = float(horizontal_flip_prob)
         if not 0.0 <= self.horizontal_flip_prob <= 1.0:
             raise ValueError(
@@ -517,60 +148,6 @@ class COCODataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.samples)
-
-    def _cache_path(self, cache_key: str) -> Optional[str]:
-        if self.cache_dir is None:
-            return None
-        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
-        return os.path.join(self.cache_dir, digest[:2], f"{digest[2:]}.pt")
-
-    def _get_lmdb_env(self):
-        if not _LMDB_AVAILABLE:
-            raise ImportError("lmdb is required for cache_backend='lmdb'. Install with `pip install lmdb`.")
-        if self._lmdb_env is None:
-            try:
-                self._lmdb_env = lmdb.open(
-                    self.cache_dir,
-                    readonly=True,
-                    lock=False,
-                    readahead=False,
-                    meminit=False,
-                    max_readers=126,
-                )
-            except Exception:
-                return None
-        return self._lmdb_env
-
-    def _refresh_lmdb_env(self) -> None:
-        if self._lmdb_env is not None:
-            try:
-                self._lmdb_env.close()
-            except Exception:
-                pass
-        self._lmdb_env = None
-
-    def _cache_has_key(self, cache_key: str) -> bool:
-        if self.cache_dir is None:
-            return False
-        if self.cache_backend == "files":
-            cache_path = self._cache_path(cache_key)
-            return cache_path is not None and os.path.exists(cache_path)
-        if self.cache_backend == "lmdb":
-            env = self._get_lmdb_env()
-            if env is None:
-                return False
-            key_bytes = cache_key.encode("utf-8")
-            try:
-                with env.begin(write=False) as txn:
-                    return txn.get(key_bytes) is not None
-            except lmdb.MapResizedError:
-                self._refresh_lmdb_env()
-                env = self._get_lmdb_env()
-                if env is None:
-                    return False
-                with env.begin(write=False) as txn:
-                    return txn.get(key_bytes) is not None
-        return False
 
     def _load_image(self, sample: Dict[str, Any], horizontal_flip: bool = False) -> torch.Tensor:
         img_path = os.path.join(self.image_dir, sample["image_file"])
@@ -670,6 +247,8 @@ class COCODataset(Dataset):
         properties = torch.zeros(rows, self.property_dim, dtype=torch.float32)
 
         for idx, cat_id in enumerate(categories):
+            if idx >= rows:
+                break
             if cat_id in self.category_id_to_idx:
                 cat_idx = self.category_id_to_idx[cat_id]
                 properties[idx, cat_idx] = 1.0
@@ -687,33 +266,102 @@ class COCODataset(Dataset):
             center_x = ((xmin + xmax + 1) / 2.0) / max(size, 1)
             center_y = ((ymin + ymax + 1) / 2.0) / max(size, 1)
 
-            properties[idx, self.num_categories] = float(2 * center_x - 1)
-            properties[idx, self.num_categories + 1] = float(2 * center_y - 1)
+            properties[idx, self.num_categories] = float(center_x)
+            properties[idx, self.num_categories + 1] = float(center_y)
             properties[idx, self.num_categories + 2] = 1.0
 
         return properties
+
+    def _bbox_center_in_crop(
+        self,
+        bbox: List[float],
+        orig_w: int,
+        orig_h: int,
+    ) -> Tuple[float, float]:
+        if orig_w <= 0 or orig_h <= 0:
+            return 0.0, 0.0
+        x, y, bw, bh = bbox
+        if orig_w <= orig_h:
+            scale = self.image_size / float(orig_w)
+            new_w = self.image_size
+            new_h = int(round(orig_h * scale))
+            crop_x = 0
+            crop_y = max((new_h - self.image_size) // 2, 0)
+        else:
+            scale = self.image_size / float(orig_h)
+            new_h = self.image_size
+            new_w = int(round(orig_w * scale))
+            crop_y = 0
+            crop_x = max((new_w - self.image_size) // 2, 0)
+
+        center_x = (x + 0.5 * bw) * scale - crop_x
+        center_y = (y + 0.5 * bh) * scale - crop_y
+
+        center_x = center_x / max(self.image_size, 1)
+        center_y = center_y / max(self.image_size, 1)
+        return float(center_x), float(center_y)
+
+    def _build_properties_from_bboxes(
+        self,
+        annotations: List[Dict[str, Any]],
+        orig_w: int,
+        orig_h: int,
+        horizontal_flip: bool,
+    ) -> Tuple[torch.Tensor, int]:
+        valid: List[Tuple[int, float, float]] = []
+        for ann in annotations:
+            cat_id = ann.get("category_id", None)
+            if cat_id not in self.category_id_to_idx:
+                continue
+            if ann.get("area", 0.0) < self.min_area:
+                continue
+            bbox = ann.get("bbox", None)
+            if bbox is None:
+                continue
+            cx, cy = self._bbox_center_in_crop(bbox, orig_w, orig_h)
+            if horizontal_flip:
+                cx = 1.0 - cx
+            cx = float(min(max(cx, 0.0), 1.0))
+            cy = float(min(max(cy, 0.0), 1.0))
+            valid.append((cat_id, cx, cy))
+
+        rows = self.max_objects if self.max_objects is not None else len(valid)
+        properties = torch.zeros(rows, self.property_dim, dtype=torch.float32)
+        max_fill = min(rows, len(valid))
+        for idx in range(max_fill):
+            cat_id, cx, cy = valid[idx]
+            cat_idx = self.category_id_to_idx[cat_id]
+            properties[idx, cat_idx] = 1.0
+            properties[idx, self.num_categories] = cx
+            properties[idx, self.num_categories + 1] = cy
+            properties[idx, self.num_categories + 2] = 1.0
+        return properties, len(valid)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.samples[idx]
         do_hflip = False
         if self.horizontal_flip_prob > 0.0:
             do_hflip = bool(torch.rand(1).item() < self.horizontal_flip_prob)
-        cache_key = f"coco/{self.split}/{sample['image_file']}"
-        if do_hflip:
-            cache_key = f"{cache_key}|hflip"
-        image = None
-        if self.skip_image_loading and self._cache_has_key(cache_key):
-            image = torch.zeros(3, self.image_size, self.image_size, dtype=torch.float32)
-        if image is None:
-            image = self._load_image(sample, horizontal_flip=do_hflip)
+        image = self._load_image(sample, horizontal_flip=do_hflip)
 
         output: Dict[str, torch.Tensor] = {
             "image": image,
             "image_id": torch.tensor(sample["image_id"]),
         }
-        output["cache_key"] = cache_key
 
         if not self.return_masks:
+            if self.return_properties:
+                img_id = sample["image_id"]
+                ann_ids = self.coco.getAnnIds(imgIds=img_id)
+                annotations = self.coco.loadAnns(ann_ids)
+                props, num_instances = self._build_properties_from_bboxes(
+                    annotations,
+                    sample["width"],
+                    sample["height"],
+                    do_hflip,
+                )
+                output["properties"] = props
+                output["num_instances"] = torch.tensor(num_instances, dtype=torch.long)
             return output
 
         # Load annotations using pycocotools (like COCO2017)
@@ -774,9 +422,17 @@ class COCODataset(Dataset):
         output["ignore_mask"] = ignore_mask_tensor.unsqueeze(0)
 
         if self.return_properties:
-            props = self._build_properties(
-                category_ids, masks_list, self.image_size
-            )
+            if self.properties_from_bboxes:
+                props, _ = self._build_properties_from_bboxes(
+                    annotations,
+                    sample["width"],
+                    sample["height"],
+                    do_hflip,
+                )
+            else:
+                props = self._build_properties(
+                    category_ids, masks_list, self.image_size
+                )
             output["properties"] = props
 
         # Areas and bounding boxes (normalized to [0, 1])
@@ -828,14 +484,12 @@ def get_coco_dataloaders(
     mode: str = "instance",
     train_return_masks: bool = True,
     val_return_masks: bool = True,
+    properties_from_bboxes: bool = False,
     train_horizontal_flip_prob: float = 0.5,
     val_horizontal_flip_prob: float = 0.0,
     train_pin_memory: bool = True,
     train_persistent_workers: Optional[bool] = None,
     train_prefetch_factor: Optional[int] = 2,
-    train_cache_dir: Optional[str] = None,
-    train_skip_image_loading: bool = False,
-    train_cache_backend: str = "files",
 ) -> Dict[str, torch.utils.data.DataLoader]:
     """
     Create COCO dataloaders for train and validation using panoptic annotations.
@@ -864,6 +518,9 @@ def get_coco_dataloaders(
     if val_num_workers is None:
         val_num_workers = train_num_workers
 
+    train_props = return_properties and (train_return_masks or properties_from_bboxes)
+    val_props = return_properties and (val_return_masks or properties_from_bboxes)
+
     train_dataset = COCODataset(
         data_root=data_root,
         split=train_split,
@@ -872,12 +529,10 @@ def get_coco_dataloaders(
         image_size=image_size,
         max_samples=max_samples_train,
         min_area=min_area,
-        return_properties=return_properties and train_return_masks,
+        return_properties=train_props,
         return_masks=train_return_masks,
+        properties_from_bboxes=properties_from_bboxes,
         horizontal_flip_prob=train_horizontal_flip_prob,
-        cache_dir=train_cache_dir,
-        skip_image_loading=train_skip_image_loading,
-        cache_backend=train_cache_backend,
     )
 
     val_dataset = COCODataset(
@@ -888,8 +543,9 @@ def get_coco_dataloaders(
         image_size=image_size,
         max_samples=max_samples_val,
         min_area=min_area,
-        return_properties=return_properties and val_return_masks,
+        return_properties=val_props,
         return_masks=val_return_masks,
+        properties_from_bboxes=properties_from_bboxes,
         horizontal_flip_prob=val_horizontal_flip_prob,
     )
 
@@ -921,132 +577,438 @@ def get_coco_dataloaders(
     return dataloaders
 
 
-def get_clevrtex_dataloaders(
+class VOCDataset(Dataset):
+    """
+    Pascal VOC 2012 segmentation dataset.
+
+    Returns a dictionary compatible with the training pipeline:
+        - image: normalized image tensor (C, H, W)
+        - masks: instance masks tensor (max_objects, H, W)
+        - image_id: integer id tensor for the sample
+        - categories: semantic class ids for each instance (max_objects,)
+    """
+
+    # VOC has 21 classes (20 object classes + background)
+    NUM_CLASSES = 21
+    CLASS_NAMES = [
+        'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle',
+        'bus', 'car', 'cat', 'chair', 'cow', 'diningtable', 'dog',
+        'horse', 'motorbike', 'person', 'pottedplant', 'sheep', 'sofa',
+        'train', 'tvmonitor'
+    ]
+
+    def __init__(
+        self,
+        data_root: str,
+        split: str = "trainaug",
+        *,
+        max_objects: Optional[int] = 20,
+        image_size: int = 256,
+        max_samples: Optional[int] = None,
+        return_masks: bool = True,
+        return_properties: bool = True,
+        horizontal_flip_prob: float = 0.0,
+    ) -> None:
+        """
+        Args:
+            data_root: Path to VOCdevkit/VOC2012 directory.
+            split: 'trainaug', 'train', or 'val'.
+            max_objects: Maximum number of objects to pad to.
+            image_size: Target image size (square).
+            max_samples: Maximum number of samples to load.
+            return_masks: Whether to return masks (set False for training).
+            return_properties: Whether to return property vectors.
+            horizontal_flip_prob: Probability of horizontal flip augmentation.
+        """
+        super().__init__()
+        self.data_root = data_root
+        self.split = split
+        self.max_objects = max_objects
+        self.image_size = image_size
+        self.return_masks = return_masks
+        self.return_properties = return_properties
+        if self.return_properties and not self.return_masks:
+            raise ValueError("Cannot return properties when masks are disabled.")
+        self.horizontal_flip_prob = float(horizontal_flip_prob)
+
+        # Read image list
+        imglist_fp = os.path.join(data_root, 'ImageSets', 'Segmentation', f'{split}.txt')
+        if not os.path.exists(imglist_fp):
+            raise FileNotFoundError(f"Image list not found at {imglist_fp}")
+
+        with open(imglist_fp, 'r') as f:
+            self.imglist = [line.strip() for line in f if line.strip()]
+
+        if max_samples is not None:
+            self.imglist = self.imglist[:max_samples]
+
+        # Property dimension: class one-hot + center_x + center_y + presence
+        self.property_dim = self.NUM_CLASSES + 3
+
+        # Use crop=True to match SPOT behavior (Resize smaller edge + CenterCrop)
+        self.transform = make_transform(resize_size=image_size, crop=True)
+
+    def __len__(self) -> int:
+        return len(self.imglist)
+
+    def _load_image(self, imgname: str, horizontal_flip: bool = False) -> torch.Tensor:
+        img_path = os.path.join(self.data_root, 'JPEGImages', f'{imgname}.jpg')
+        img = Image.open(img_path).convert('RGB')
+        if horizontal_flip:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        return self.transform(img)
+
+    def _load_mask(self, imgname: str, mask_type: str, horizontal_flip: bool = False) -> np.ndarray:
+        """Load segmentation mask (SegmentationClass or SegmentationObject)."""
+        mask_path = os.path.join(self.data_root, mask_type, f'{imgname}.png')
+        if not os.path.exists(mask_path):
+            return None
+        mask = Image.open(mask_path)
+        if horizontal_flip:
+            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # Resize with nearest neighbor to preserve labels
+        mask = TF.resize(mask, self.image_size, interpolation=torchvision.transforms.InterpolationMode.NEAREST)
+        mask = TF.center_crop(mask, self.image_size)
+        return np.array(mask)
+
+    def _build_instance_masks(
+        self, instance_mask: np.ndarray, class_mask: np.ndarray
+    ) -> Tuple[List[torch.Tensor], List[int]]:
+        """Build per-instance binary masks from VOC instance segmentation."""
+        masks = []
+        categories = []
+
+        # Get unique instance IDs (excluding 0=background and 255=boundary)
+        instance_ids = np.unique(instance_mask)
+        instance_ids = instance_ids[(instance_ids != 0) & (instance_ids != 255)]
+
+        for inst_id in instance_ids:
+            mask_bool = (instance_mask == inst_id)
+            if not mask_bool.any():
+                continue
+
+            # Get the class for this instance from the class mask
+            inst_pixels = class_mask[mask_bool]
+            inst_pixels = inst_pixels[(inst_pixels != 0) & (inst_pixels != 255)]
+            if len(inst_pixels) == 0:
+                continue
+            class_id = int(np.bincount(inst_pixels).argmax())
+
+            masks.append(torch.from_numpy(mask_bool.astype(np.float32)))
+            categories.append(class_id)
+
+        return masks, categories
+
+    def _build_properties(
+        self,
+        categories: List[int],
+        masks: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Build property vectors (class one-hot + normalized center + presence)."""
+        num_instances = len(categories)
+        rows = self.max_objects if self.max_objects is not None else num_instances
+        properties = torch.zeros(rows, self.property_dim, dtype=torch.float32)
+
+        for idx, cat_id in enumerate(categories):
+            if idx >= rows:
+                break
+            # Class one-hot
+            if 0 <= cat_id < self.NUM_CLASSES:
+                properties[idx, cat_id] = 1.0
+
+            # Compute center from mask
+            mask_bool = masks[idx].numpy() > 0.5
+            ys, xs = np.nonzero(mask_bool)
+            if len(xs) == 0:
+                continue
+
+            center_x = ((xs.min() + xs.max() + 1) / 2.0) / max(self.image_size, 1)
+            center_y = ((ys.min() + ys.max() + 1) / 2.0) / max(self.image_size, 1)
+
+            properties[idx, self.NUM_CLASSES] = float(center_x)
+            properties[idx, self.NUM_CLASSES + 1] = float(center_y)
+            properties[idx, self.NUM_CLASSES + 2] = 1.0  # presence
+
+        return properties
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        imgname = self.imglist[idx]
+
+        do_hflip = False
+        if self.horizontal_flip_prob > 0.0:
+            do_hflip = bool(torch.rand(1).item() < self.horizontal_flip_prob)
+
+        image = self._load_image(imgname, horizontal_flip=do_hflip)
+
+        output: Dict[str, torch.Tensor] = {
+            'image': image,
+            'image_id': torch.tensor(idx),
+        }
+
+        if not self.return_masks:
+            return output
+
+        # Load masks
+        instance_mask = self._load_mask(imgname, 'SegmentationObject', horizontal_flip=do_hflip)
+        class_mask = self._load_mask(imgname, 'SegmentationClass', horizontal_flip=do_hflip)
+
+        if instance_mask is None or class_mask is None:
+            # Return empty masks if not available
+            if self.max_objects is not None:
+                output['masks'] = torch.zeros(self.max_objects, self.image_size, self.image_size)
+                output['categories'] = torch.full((self.max_objects,), -1, dtype=torch.long)
+            else:
+                output['masks'] = torch.zeros(0, self.image_size, self.image_size)
+                output['categories'] = torch.empty(0, dtype=torch.long)
+            output['num_instances'] = torch.tensor(0, dtype=torch.long)
+            output['ignore_mask'] = torch.zeros(1, self.image_size, self.image_size)
+            if self.return_properties:
+                rows = self.max_objects if self.max_objects is not None else 0
+                output['properties'] = torch.zeros(rows, self.property_dim)
+            return output
+
+        masks_list, categories = self._build_instance_masks(instance_mask, class_mask)
+        num_instances = len(categories)
+
+        # Build output tensors
+        if self.max_objects is not None:
+            mask_tensor = torch.zeros(self.max_objects, self.image_size, self.image_size, dtype=torch.float32)
+            category_tensor = torch.full((self.max_objects,), -1, dtype=torch.long)
+            for i, mask in enumerate(masks_list):
+                if i >= self.max_objects:
+                    break
+                mask_tensor[i] = mask
+                category_tensor[i] = categories[i]
+        else:
+            mask_tensor = torch.stack(masks_list) if masks_list else torch.zeros(0, self.image_size, self.image_size)
+            category_tensor = torch.tensor(categories, dtype=torch.long) if categories else torch.empty(0, dtype=torch.long)
+
+        output['masks'] = mask_tensor
+        output['categories'] = category_tensor
+        output['num_instances'] = torch.tensor(num_instances, dtype=torch.long)
+
+        # Ignore mask (boundary pixels = 255)
+        ignore_mask = torch.from_numpy((instance_mask == 255).astype(np.float32)).unsqueeze(0)
+        output['ignore_mask'] = ignore_mask
+
+        if self.return_properties:
+            output['properties'] = self._build_properties(categories, masks_list)
+
+        return output
+
+
+class MOViDataset(Dataset):
+    """
+    MOVi (C or E) video dataset for object-centric learning.
+
+    Returns a dictionary compatible with the training pipeline:
+        - image: normalized image tensor (C, H, W)
+        - masks: instance masks tensor (max_objects, H, W)
+        - image_id: integer id tensor for the sample
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        split: str = "train",
+        *,
+        max_objects: int = 25,
+        image_size: int = 128,
+        max_samples: Optional[int] = None,
+        return_masks: bool = True,
+        frames_per_clip: int = 24,
+        predefined_json_paths: Optional[str] = None,
+        horizontal_flip_prob: float = 0.0,
+    ) -> None:
+        """
+        Args:
+            data_root: Path to MOVi level directory (e.g., data/MOVi/c/train).
+            split: 'train' or 'validation'.
+            max_objects: Maximum number of objects to pad to.
+            image_size: Target image size (square).
+            max_samples: Maximum number of samples to load.
+            return_masks: Whether to return masks (set False for training).
+            frames_per_clip: Number of frames to sample per clip (for train).
+            predefined_json_paths: Path to JSON file with pre-computed paths.
+            horizontal_flip_prob: Probability of horizontal flip augmentation.
+        """
+        super().__init__()
+        import glob
+        from pathlib import Path
+
+        self.data_root = data_root
+        self.split = split
+        self.max_objects = max_objects
+        self.image_size = image_size
+        self.return_masks = return_masks
+        self.frames_per_clip = frames_per_clip
+        self.horizontal_flip_prob = float(horizontal_flip_prob)
+
+        # Get all video directories
+        total_dirs = sorted(glob.glob(os.path.join(data_root, '*')))
+        total_dirs = [d for d in total_dirs if os.path.isdir(d)]
+
+        # Load or build path lists
+        if split == 'train' and predefined_json_paths is not None and os.path.exists(predefined_json_paths):
+            import json
+            with open(predefined_json_paths, 'r') as fp:
+                paths_persistence = json.load(fp)
+            self.rgb = [Path(p) for p in paths_persistence['rgb']]
+            self.mask = [[Path(p) for p in m] for m in paths_persistence['mask']]
+        else:
+            self.rgb = []
+            self.mask = []
+            import random
+
+            for dir_path in total_dirs:
+                image_paths = glob.glob(os.path.join(dir_path, '*_image.png'))
+                if split == 'train':
+                    random.shuffle(image_paths)
+                    image_paths = image_paths[:frames_per_clip]
+                else:
+                    image_paths = sorted(image_paths)
+
+                for image_path in image_paths:
+                    p = Path(image_path)
+                    self.rgb.append(p)
+                    # Build mask paths for all possible objects
+                    frame_id = p.stem.split('_')[0]
+                    self.mask.append([
+                        p.parent / f"{frame_id}_mask_{n:02}.png"
+                        for n in range(max_objects)
+                    ])
+
+        if max_samples is not None:
+            self.rgb = self.rgb[:max_samples]
+            self.mask = self.mask[:max_samples]
+
+        self.transform = make_transform(resize_size=image_size)
+
+    def __len__(self) -> int:
+        return len(self.rgb)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        img_path = self.rgb[idx]
+
+        do_hflip = False
+        if self.horizontal_flip_prob > 0.0:
+            do_hflip = bool(torch.rand(1).item() < self.horizontal_flip_prob)
+
+        img = Image.open(img_path).convert('RGB')
+        if do_hflip:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        img = self.transform(img)
+
+        output: Dict[str, torch.Tensor] = {
+            'image': img,
+            'image_id': torch.tensor(idx),
+        }
+
+        if not self.return_masks:
+            return output
+
+        # Load instance masks
+        mask_paths = self.mask[idx]
+        masks_list = []
+        for mask_path in mask_paths:
+            if mask_path.exists():
+                mask = Image.open(mask_path).convert('L')
+                if do_hflip:
+                    mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+                mask = mask.resize((self.image_size, self.image_size), Image.NEAREST)
+                mask_tensor = torch.from_numpy(np.array(mask) > 127).float()
+                masks_list.append(mask_tensor)
+            else:
+                masks_list.append(torch.zeros(self.image_size, self.image_size))
+
+        mask_tensor = torch.stack(masks_list)
+
+        # Count actual instances (masks with non-zero pixels)
+        num_instances = sum(1 for m in masks_list if m.sum() > 0)
+
+        output['masks'] = mask_tensor
+        output['num_instances'] = torch.tensor(num_instances, dtype=torch.long)
+        # MOVi has no semantic categories, use instance ID as category
+        output['categories'] = torch.arange(self.max_objects, dtype=torch.long)
+        output['ignore_mask'] = torch.zeros(1, self.image_size, self.image_size)
+
+        return output
+
+
+def get_voc_dataloaders(
     data_root: str,
-    variant: str = 'full',
     train_batch_size: int = 32,
     val_batch_size: Optional[int] = None,
-    test_batch_size: Optional[int] = None,
     train_num_workers: int = 4,
     val_num_workers: Optional[int] = None,
-    test_num_workers: Optional[int] = None,
     image_size: int = 256,
-    max_objects: int = 10,
-    max_samples: Optional[int] = None,
+    max_objects: Optional[int] = 20,
+    max_samples_train: Optional[int] = None,
+    max_samples_val: Optional[int] = None,
     return_properties: bool = True,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    seed: int = 42,
+    train_split: str = "trainaug",
+    val_split: str = "val",
     train_return_masks: bool = True,
     val_return_masks: bool = True,
-    test_return_masks: bool = True,
+    train_horizontal_flip_prob: float = 0.5,
+    val_horizontal_flip_prob: float = 0.0,
     train_pin_memory: bool = True,
     train_persistent_workers: Optional[bool] = None,
     train_prefetch_factor: Optional[int] = 2,
-    train_cache_dir: Optional[str] = None,
-    train_skip_image_loading: bool = False,
-    train_cache_backend: str = "files",
 ) -> Dict[str, torch.utils.data.DataLoader]:
     """
-    Create CLEVRTEX dataloaders with train/val/test splits.
-    
+    Create VOC dataloaders for train and validation.
+
     Args:
-        data_root: Path to clevrtexv2 directory
-        variant: 'full' or 'outd'
-        train_batch_size: Training batch size
-        val_batch_size: Optional validation batch size (defaults to training size)
-        test_batch_size: Optional test batch size (defaults to validation size)
-        train_num_workers: Number of workers for the training loader
-        val_num_workers: Optional number of workers for validation (defaults to training)
-        test_num_workers: Optional number of workers for test (defaults to validation)
-        image_size: Target image size (square)
-        max_objects: Maximum number of objects
-        max_samples: Maximum number of samples to load (None for all)
-        return_properties: Whether to return property vectors
-        train_ratio: Ratio of data for training
-        val_ratio: Ratio of data for validation
-        test_ratio: Ratio of data for testing
-        seed: Random seed for reproducible splitting
-        
-    Returns:
-        Dictionary of dataloaders with keys 'train', 'val', 'test'
+        data_root: Path to VOCdevkit/VOC2012 directory.
+        train_batch_size: Batch size for the training dataloader.
+        val_batch_size: Optional batch size for validation (defaults to train_batch_size).
+        train_num_workers: Number of dataloader workers for training.
+        val_num_workers: Optional number of workers for validation.
+        image_size: Output image size (square).
+        max_objects: Maximum number of objects allowed per image.
+        max_samples_train: Optional limit on training samples.
+        max_samples_val: Optional limit on validation samples.
+        return_properties: Whether to return per-mask property vectors.
+        train_split: Training split name ('trainaug' or 'train').
+        val_split: Validation split name ('val').
+        train_horizontal_flip_prob: Probability of horizontal flip for training.
+        val_horizontal_flip_prob: Probability of horizontal flip for validation.
     """
-    # Validate ratios
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
-        "train_ratio + val_ratio + test_ratio must equal 1.0"
-    
-    # Create full dataset to determine splits
-    full_dataset = CLEVRTEXDataset(
-        data_root=data_root,
-        variant=variant,
-        max_objects=max_objects,
-        image_size=image_size,
-        max_samples=max_samples,
-        return_properties=return_properties,
-        return_masks=True,
-    )
-    
-    # Get total size and compute split sizes
-    total_size = len(full_dataset)
-    train_size = int(total_size * train_ratio)
-    val_size = int(total_size * val_ratio)
-    test_size = total_size - train_size - val_size
-    
-    # Create reproducible random split
-    rng = np.random.RandomState(seed)
-    indices = rng.permutation(total_size)
-    
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size + val_size]
-    test_indices = indices[train_size + val_size:]
-    
-    train_samples = [full_dataset.samples[i] for i in train_indices]
-    val_samples = [full_dataset.samples[i] for i in val_indices]
-    test_samples = [full_dataset.samples[i] for i in test_indices]
-
-    def build_dataset(
-        sample_list: List[Dict[str, Any]],
-        return_masks: bool,
-        *,
-        cache_dir: Optional[str] = None,
-        skip_image_loading: bool = False,
-        cache_backend: str = "files",
-    ) -> CLEVRTEXDataset:
-        return CLEVRTEXDataset(
-            data_root=data_root,
-            variant=variant,
-            max_objects=max_objects,
-            image_size=image_size,
-            max_samples=None,
-            return_properties=return_properties and return_masks,
-            return_masks=return_masks,
-            samples=sample_list,
-            cache_dir=cache_dir,
-            skip_image_loading=skip_image_loading,
-            cache_backend=cache_backend,
-        )
-
     if val_batch_size is None:
         val_batch_size = train_batch_size
-    if test_batch_size is None:
-        test_batch_size = val_batch_size
     if val_num_workers is None:
         val_num_workers = train_num_workers
-    if test_num_workers is None:
-        test_num_workers = val_num_workers
 
-    train_dataset = build_dataset(
-        train_samples,
-        train_return_masks,
-        cache_dir=train_cache_dir,
-        skip_image_loading=train_skip_image_loading,
-        cache_backend=train_cache_backend,
+    train_dataset = VOCDataset(
+        data_root=data_root,
+        split=train_split,
+        max_objects=max_objects,
+        image_size=image_size,
+        max_samples=max_samples_train,
+        return_masks=train_return_masks,
+        return_properties=return_properties and train_return_masks,
+        horizontal_flip_prob=train_horizontal_flip_prob,
     )
-    val_dataset = build_dataset(val_samples, val_return_masks)
-    test_dataset = build_dataset(test_samples, test_return_masks)
-    
-    # Create dataloaders
+
+    val_dataset = VOCDataset(
+        data_root=data_root,
+        split=val_split,
+        max_objects=max_objects,
+        image_size=image_size,
+        max_samples=max_samples_val,
+        return_masks=val_return_masks,
+        return_properties=return_properties and val_return_masks,
+        horizontal_flip_prob=val_horizontal_flip_prob,
+    )
+
+    # persistent_workers requires num_workers > 0
+    effective_persistent_workers = (
+        (train_persistent_workers if train_persistent_workers is not None else True)
+        and train_num_workers > 0
+    )
+
     dataloaders = {
         'train': torch.utils.data.DataLoader(
             train_dataset,
@@ -1054,9 +1016,7 @@ def get_clevrtex_dataloaders(
             shuffle=True,
             num_workers=train_num_workers,
             pin_memory=bool(train_pin_memory),
-            persistent_workers=(
-                train_persistent_workers if train_persistent_workers is not None else train_num_workers > 0
-            ),
+            persistent_workers=effective_persistent_workers,
             prefetch_factor=(
                 train_prefetch_factor if train_num_workers > 0 else None
             ),
@@ -1070,15 +1030,105 @@ def get_clevrtex_dataloaders(
             persistent_workers=False,
             prefetch_factor=None,
         ),
-        'test': torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=test_batch_size,
+    }
+
+    return dataloaders
+
+
+def get_movi_dataloaders(
+    data_root: str,
+    level: str = "c",
+    train_batch_size: int = 32,
+    val_batch_size: Optional[int] = None,
+    train_num_workers: int = 4,
+    val_num_workers: Optional[int] = None,
+    image_size: int = 128,
+    max_objects: int = 25,
+    max_samples_train: Optional[int] = None,
+    max_samples_val: Optional[int] = None,
+    frames_per_clip: int = 24,
+    train_return_masks: bool = True,
+    val_return_masks: bool = True,
+    train_horizontal_flip_prob: float = 0.5,
+    val_horizontal_flip_prob: float = 0.0,
+    train_pin_memory: bool = True,
+    train_persistent_workers: Optional[bool] = None,
+    train_prefetch_factor: Optional[int] = 2,
+) -> Dict[str, torch.utils.data.DataLoader]:
+    """
+    Create MOVi dataloaders for train and validation.
+
+    Args:
+        data_root: Path to MOVi directory (containing 'c' and/or 'e' subdirs).
+        level: MOVi level ('c' or 'e').
+        train_batch_size: Batch size for the training dataloader.
+        val_batch_size: Optional batch size for validation.
+        train_num_workers: Number of dataloader workers for training.
+        val_num_workers: Optional number of workers for validation.
+        image_size: Output image size (square).
+        max_objects: Maximum number of objects (25 for MOVi).
+        max_samples_train: Optional limit on training samples.
+        max_samples_val: Optional limit on validation samples.
+        frames_per_clip: Number of frames to sample per clip for training.
+        train_horizontal_flip_prob: Probability of horizontal flip for training.
+        val_horizontal_flip_prob: Probability of horizontal flip for validation.
+    """
+    if val_batch_size is None:
+        val_batch_size = train_batch_size
+    if val_num_workers is None:
+        val_num_workers = train_num_workers
+
+    train_root = os.path.join(data_root, level, 'train')
+    val_root = os.path.join(data_root, level, 'validation')
+
+    train_dataset = MOViDataset(
+        data_root=train_root,
+        split='train',
+        max_objects=max_objects,
+        image_size=image_size,
+        max_samples=max_samples_train,
+        return_masks=train_return_masks,
+        frames_per_clip=frames_per_clip,
+        horizontal_flip_prob=train_horizontal_flip_prob,
+    )
+
+    val_dataset = MOViDataset(
+        data_root=val_root,
+        split='validation',
+        max_objects=max_objects,
+        image_size=image_size,
+        max_samples=max_samples_val,
+        return_masks=val_return_masks,
+        horizontal_flip_prob=val_horizontal_flip_prob,
+    )
+
+    # persistent_workers requires num_workers > 0
+    effective_persistent_workers = (
+        (train_persistent_workers if train_persistent_workers is not None else True)
+        and train_num_workers > 0
+    )
+
+    dataloaders = {
+        'train': torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=train_batch_size,
+            shuffle=True,
+            num_workers=train_num_workers,
+            pin_memory=bool(train_pin_memory),
+            persistent_workers=effective_persistent_workers,
+            prefetch_factor=(
+                train_prefetch_factor if train_num_workers > 0 else None
+            ),
+        ),
+        'val': torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
             shuffle=False,
-            num_workers=test_num_workers,
+            num_workers=val_num_workers,
             pin_memory=True,
             persistent_workers=False,
             prefetch_factor=None,
-        )
+        ),
     }
-    
+
     return dataloaders
