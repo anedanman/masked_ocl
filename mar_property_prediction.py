@@ -1,7 +1,5 @@
 import argparse
-import math
 import os
-import sys
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional, List
 
@@ -283,12 +281,10 @@ def run_validation(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Property prediction from slots (MAR / SPOT).")
+    parser = argparse.ArgumentParser(description="Property prediction from slots (MAR).")
     parser.add_argument("--dataset", choices=["coco", "voc"], default="coco")
-    parser.add_argument("--model", choices=["mar", "spot"], default="mar")
     parser.add_argument("--mar-config", type=str, default=None)
     parser.add_argument("--mar-checkpoint", type=str, default=None)
-    parser.add_argument("--spot-checkpoint", type=str, default=None)
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--val-batch-size", type=int, default=64)
@@ -315,15 +311,12 @@ def main() -> None:
     if args.dataset == "coco":
         default_mar_cfg = "runs/important/mar_coco_mask0.7_1.0_Bdino_mlppos_registerslots_maskmatch_noencoder/config.yaml"
         default_mar_ckpt = "runs/important/mar_coco_mask0.7_1.0_Bdino_mlppos_registerslots_maskmatch_noencoder/checkpoint_best_metric.pt"
-        default_spot_ckpt = "spot/spot_chkpts/spot_coco_checkpoint.pt.tar"
     else:
         default_mar_cfg = "runs/important/mar_voc_Bdino/config.yaml"
         default_mar_ckpt = "runs/important/mar_voc_Bdino/checkpoint_best_metric.pt"
-        default_spot_ckpt = "spot/spot_chkpts/spot_voc_checkpoint.pt.tar"
 
     mar_config = args.mar_config or default_mar_cfg
     mar_checkpoint = args.mar_checkpoint or default_mar_ckpt
-    spot_checkpoint = args.spot_checkpoint or default_spot_ckpt
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_global_seed(args.seed, deterministic=False)
@@ -343,39 +336,25 @@ def main() -> None:
                 config=vars(args),
             )
 
-    if args.model == "mar":
-        cfg, dino, slot_attn, need_cls_token, slot_dim = load_mar_backbone(
-            mar_config, mar_checkpoint, device
-        )
-        data_cfg = cfg.get("data", {})
-        image_size = int(data_cfg.get("image_size", 256))
-        max_objects = data_cfg.get("max_objects", None)
-        if args.data_root is not None:
-            data_root = args.data_root
-        else:
-            if args.dataset == "voc":
-                data_root = data_cfg.get("root", "./data/voc/VOCdevkit/VOC2012")
-            else:
-                data_root = data_cfg.get("root", "./data/coco")
-        train_split = data_cfg.get("train_split", "train2017" if args.dataset == "coco" else "trainaug")
-        val_split = data_cfg.get("val_split", "val2017" if args.dataset == "coco" else "val")
-        train_flip_prob = data_cfg.get("train_horizontal_flip_prob", 0.5)
-        val_flip_prob = data_cfg.get("val_horizontal_flip_prob", 0.0)
-
-        slot_extractor = lambda images: extract_slots_mar(images, dino, slot_attn, need_cls_token)
+    cfg, dino, slot_attn, need_cls_token, slot_dim = load_mar_backbone(
+        mar_config, mar_checkpoint, device
+    )
+    data_cfg = cfg.get("data", {})
+    image_size = int(data_cfg.get("image_size", 256))
+    max_objects = data_cfg.get("max_objects", None)
+    if args.data_root is not None:
+        data_root = args.data_root
     else:
-        spot_model, slot_dim, image_size = load_spot_backbone(spot_checkpoint, device)
-        if args.data_root is not None:
-            data_root = args.data_root
+        if args.dataset == "voc":
+            data_root = data_cfg.get("root", "./data/voc/VOCdevkit/VOC2012")
         else:
-            data_root = "./data/coco" if args.dataset == "coco" else "./data/voc/VOCdevkit/VOC2012"
-        max_objects = 20 if args.dataset == "voc" else 60
-        train_split = "train2017" if args.dataset == "coco" else "trainaug"
-        val_split = "val2017" if args.dataset == "coco" else "val"
-        train_flip_prob = 0.5
-        val_flip_prob = 0.0
+            data_root = data_cfg.get("root", "./data/coco")
+    train_split = data_cfg.get("train_split", "train2017" if args.dataset == "coco" else "trainaug")
+    val_split = data_cfg.get("val_split", "val2017" if args.dataset == "coco" else "val")
+    train_flip_prob = data_cfg.get("train_horizontal_flip_prob", 0.5)
+    val_flip_prob = data_cfg.get("val_horizontal_flip_prob", 0.0)
 
-        slot_extractor = lambda images: extract_slots_spot(images, spot_model)
+    slot_extractor = lambda images: extract_slots_mar(images, dino, slot_attn, need_cls_token)
 
     if args.dataset == "voc":
         imglist_fp = os.path.join(data_root, "ImageSets", "Segmentation", f"{train_split}.txt")

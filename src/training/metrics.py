@@ -54,6 +54,15 @@ def create_spot_metrics(
     return {name: metric.to(device) for name, metric in metrics.items()}
 
 
+def create_mar_metrics(
+    device: torch.device,
+    target: Literal["instance", "semantic"],
+    ignore_overlaps: bool = True,
+) -> Dict[str, torch.nn.Module]:
+    """Create MAR evaluation metrics (alias of create_spot_metrics)."""
+    return create_spot_metrics(device=device, target=target, ignore_overlaps=ignore_overlaps)
+
+
 def create_mask_metrics(
     device: torch.device,
     ignore_overlaps: bool = True,
