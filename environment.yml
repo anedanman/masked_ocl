@@ -1,4 +1,4 @@
-name: base
+name: slot-mar
 channels:
   - conda-forge
   - defaults
