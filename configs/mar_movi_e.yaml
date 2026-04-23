@@ -114,6 +114,7 @@ masking:
 
 mask_matching:
   enabled: true
+  loss_type: bce  # bce | soft_ce | kl
   lambda_start: 0.0
   lambda_end: 0.015
   lambda_warmup_steps: 0

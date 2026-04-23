@@ -1,5 +1,8 @@
+model:
+  type: ar
+
 train:
-  max_updates: 100002
+  max_updates: 150002
   val_every_updates: 10000
   log_every_updates: 500
   val_iterative: false
@@ -16,7 +19,7 @@ train:
   batch_size: 64
   val_batch_size: 32
   gradient_accumulation_steps: 1
-  num_workers: 16
+  num_workers: 8
   val_num_workers: 4
   prefetch_factor: 4
   pin_memory: true
@@ -71,10 +74,10 @@ slots:
   num_iterations: 5
   num_slots: 7
   num_heads: 1
-  slot_size: 256
+  slot_size: 512
   input_size: null
   out_size: null
-  mlp_hidden_size: 1024
+  mlp_hidden_size: 2048
   truncate: fixed-point
   qk_rmsnorm: false
   qk_rmsnorm_eps: 1.0e-6
@@ -82,42 +85,37 @@ slots:
   init_mode: gaussian
   kmeans_iters: 10
 
-mar:
-  model_dim: 512
+ar:
+  model_dim: 768
   encoder_depth: 0
   decoder_depth: 4
-  num_heads: 4
-  mlp_hidden_dim: 2048
+  num_heads: 6
+  mlp_hidden_dim: 3072
   slot_cross_mlp: false
   dropout: 0.0
-  self_attn_type: full # 'full' or 'causal'
-  prediction_order: random
-  predict_tokens: null
+  self_attn_type: causal
+  prediction_order: raster  # 'random' or 'raster'
+  random_order_prob_start: 1.0  # Initial probability that a training sample uses a random token order instead of raster order.
+  random_order_prob_start_step: 50000  # First training step where the random-order probability starts changing away from `random_order_prob_start`.
+  random_order_prob_end: 0.0  # Final probability that a training sample uses a random token order after the schedule finishes.
+  random_order_prob_end_step: 100000  # Training step where the random-order schedule reaches `random_order_prob_end`.
   buffer_size: 64
   register_slots: 64
-  slot_conditioned: false
-  slot_conditional_depth: 2
-  slot_conditional_dropout: 0.0
-  slot_conditional_qk_norm: false
-  slot_conditional_embed: true
-  add_pos_to_known: false
+  slot_conditioned: false  # Runs slot-conditioned attention blocks that let slots and ordered token inputs interact before decoding.
+  slot_conditional_depth: 2  # Number of slot-conditioned attention blocks to apply when `slot_conditioned` is enabled.
+  slot_conditional_dropout: 0.0  # Dropout used inside the slot-conditioned attention blocks.
+  slot_conditional_qk_norm: false  # Enables query/key normalization inside the slot-conditioned attention blocks for more stable attention scores.
+  slot_conditional_embed: false  # Adds a learned slot-mixture embedding to each autoregressive token input based on slot-attention assignments.
   qk_norm: false
   use_bos_token: true
-  pos_embed_type: mlp  # 'learned' (like original MAR) or 'mlp'
-  max_seq_len: 256  # max sequence length for learned positional embeddings
-
-masking:
-  strategy: order  # 'order' or 'slot_conditioned'
-  ratio_min: 0.7
-  ratio_max: 1.0
-  ratio_mode: uniform  # 'truncated_gaussian' (like original MAR) or 'uniform'
-  ratio_std: 0.25  # std dev for truncated Gaussian (centered at ratio_max)
+  pos_embed_type: mlp
+  max_seq_len: 256
 
 mask_matching:
   enabled: true
   loss_type: bce  # bce | soft_ce | kl
   lambda_start: 0.0
-  lambda_end: 0.05
+  lambda_end: 0.01
   coeff_by_loss:
     bce: 1.0
     soft_ce: 0.211340206185567
@@ -127,9 +125,9 @@ mask_matching:
 
 wandb:
   enabled: true
-  project: slot-mar
+  project: slot-ar
   entity: null
-  run_name: mar_coco_B
+  run_name: ar_coco_B_0.01_mask_matching_no_slot_mixture_raster
   mode: online
 
 output:

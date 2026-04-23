@@ -1,0 +1,3 @@
+[submodule "pydensecrf"]
+	path = pydensecrf
+	url = https://github.com/lucasb-eyer/pydensecrf

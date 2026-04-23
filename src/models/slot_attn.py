@@ -3,7 +3,7 @@ import sys
 if __name__ == "__main__":
     sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
 import math
-from typing import Optional
+from typing import Any, Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -13,6 +13,7 @@ from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 from src.models.dino_rope import RopePositionEmbedding
+from src.models.token_crf import TokenCRFContext, TokenFeatureCRF
 
 def is_square(n: float) -> bool:
     if n < 0:
@@ -104,7 +105,8 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                  rescale_coords=None, shift_coords=None, jitter_coords=None,
                  epsilon=1e-8, truncate='none',
                  qk_rmsnorm=False, qk_rmsnorm_eps=1e-6,
-                 init_mode='gaussian', kmeans_iters=10):
+                 init_mode='gaussian', kmeans_iters=10,
+                 token_crf_cfg=None):
         super().__init__()
 
         self.pos = RopePositionEmbedding(
@@ -177,17 +179,110 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         self.out_layer_norm = nn.LayerNorm(slot_size)
         self.out_linear = nn.Linear(slot_size, out_size)
         self._k_scale = slot_size ** (-0.5)
+        self.token_crf = None
+        self.token_crf_mode = "off"
+        self.token_crf_apply_every_iteration = False
+        self.token_crf_ste_grad = False
+        self.token_crf_blend = 0.5
+        self.token_crf_return_refined_attn = True
+
+        token_crf_cfg = dict(token_crf_cfg or {})
+        if bool(token_crf_cfg.get("enabled", False)):
+            spatial_cfg = dict(token_crf_cfg.get("spatial", {}) or {})
+            appearance_cfg = dict(token_crf_cfg.get("appearance", {}) or {})
+            slot_crf_cfg = dict(token_crf_cfg.get("slot_attention", {}) or {})
+
+            spatial_enabled = bool(spatial_cfg.get("enabled", True))
+            appearance_enabled = bool(appearance_cfg.get("enabled", True))
+
+            self.token_crf = TokenFeatureCRF(
+                num_iterations=int(token_crf_cfg.get("num_iterations", 5)),
+                spatial_weight=(
+                    float(spatial_cfg.get("weight", 3.0)) if spatial_enabled else 0.0
+                ),
+                spatial_sigma=float(spatial_cfg.get("sigma", 1.5)),
+                appearance_weight=(
+                    float(appearance_cfg.get("weight", 6.0)) if appearance_enabled else 0.0
+                ),
+                appearance_sigma=float(appearance_cfg.get("sigma", 0.35)),
+                appearance_spatial_sigma=float(
+                    appearance_cfg.get("spatial_sigma", 2.5)
+                ),
+                pairwise_topk=token_crf_cfg.get("pairwise_topk", None),
+                exclude_self=bool(token_crf_cfg.get("exclude_self", True)),
+                similarity=str(appearance_cfg.get("similarity", "cosine")),
+                normalize_features=bool(appearance_cfg.get("normalize_features", True)),
+                detach_features=bool(token_crf_cfg.get("detach_features", True)),
+                unary_temperature=float(token_crf_cfg.get("unary_temperature", 1.0)),
+                eps=float(token_crf_cfg.get("eps", epsilon)),
+            )
+
+            crf_mode = str(slot_crf_cfg.get("mode", "disabled")).lower()
+            crf_mode = {
+                "disabled": "off",
+                "false": "off",
+                "none": "off",
+            }.get(crf_mode, crf_mode)
+            self.token_crf_mode = crf_mode
+            if self.token_crf_mode not in ("off", "replace", "blend"):
+                raise ValueError(
+                    "crf.slot_attention.mode must be 'disabled', 'replace', or 'blend'."
+                )
+            self.token_crf_apply_every_iteration = bool(
+                slot_crf_cfg.get("apply_every_iteration", False)
+            )
+            self.token_crf_ste_grad = bool(slot_crf_cfg.get("ste_grad", False))
+            self.token_crf_blend = float(slot_crf_cfg.get("blend", 0.5))
+            self.token_crf_return_refined_attn = bool(
+                slot_crf_cfg.get("return_refined_attn", True)
+            )
     
     def _rmsnorm(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self.qk_rmsnorm:
             return tensor
         rms = tensor.pow(2).mean(dim=-1, keepdim=True)
         return tensor * torch.rsqrt(rms + self.qk_rmsnorm_eps)
+
+    def _attn_to_assignments(self, attn_vis: torch.Tensor) -> torch.Tensor:
+        attn = attn_vis.sum(dim=1)
+        denom = attn.sum(dim=-1, keepdim=True).clamp_min(self.epsilon)
+        return attn / denom
+
+    def _assignments_to_attn_vis(
+        self,
+        raw_attn_vis: torch.Tensor,
+        refined_assignments: torch.Tensor,
+    ) -> torch.Tensor:
+        head_mass = raw_attn_vis.sum(dim=-1, keepdim=True)
+        return head_mass * refined_assignments.unsqueeze(1)
+
+    def _apply_token_crf_mode(
+        self,
+        raw_attn_vis: torch.Tensor,
+        refined_attn_vis: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.token_crf_mode == "replace":
+            effective = refined_attn_vis
+        elif self.token_crf_mode == "blend":
+            blend = min(max(self.token_crf_blend, 0.0), 1.0)
+            effective = (1.0 - blend) * raw_attn_vis + blend * refined_attn_vis
+        else:
+            effective = raw_attn_vis
+
+        if self.token_crf_mode != "off" and self.token_crf_ste_grad:
+            effective = effective.detach() + (raw_attn_vis - raw_attn_vis.detach())
+        return effective
         
-    def forward(self, inputs, *, cls_token: Optional[torch.Tensor] = None):
-        slots, attns, init_loss = self.forward_slots(inputs, cls_token=cls_token)
+    def forward(self, inputs, *, cls_token: Optional[torch.Tensor] = None, return_info: bool = False):
+        result = self.forward_slots(inputs, cls_token=cls_token, return_info=return_info)
+        if return_info:
+            slots, attns, init_loss, info = result
+        else:
+            slots, attns, init_loss = result
         slots = self.out_layer_norm(slots)
         slots = self.out_linear(slots)
+        if return_info:
+            return slots, attns, init_loss, info
         return slots, attns, init_loss
 
     def forward_slots(
@@ -200,12 +295,14 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         guided_grad_substitute: bool = False,
         num_iterations: Optional[int] = None,
         cls_token: Optional[torch.Tensor] = None,
+        return_info: bool = False,
     ):
         """
         inputs: batch_size x input_size x h x w
         return: batch_size x num_slots x slot_size
         """
         B, input_size, h, w = inputs.size()
+        raw_token_features = rearrange(inputs, 'b n_inp h w -> b (h w) n_inp')
         # inputs = self.pos.apply(inputs)
         inputs = rearrange(inputs, 'b n_inp h w -> b (h w) n_inp')
         inputs = self.in_mlp(self.in_layer_norm(inputs))
@@ -271,6 +368,14 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             k = self._k_scale * k
 
         attn_vis = None
+        token_crf_context: Optional[TokenCRFContext] = None
+        if self.token_crf is not None:
+            token_crf_context = self.token_crf.build_context(
+                raw_token_features,
+                spatial_size=(h, w),
+                token_mask=valid_token_mask,
+            )
+        last_iter_info: dict[str, Any] = {}
         total_iterations = self.num_iterations if num_iterations is None else int(num_iterations)
         if total_iterations <= 0:
             raise ValueError(f"num_iterations must be positive (got {total_iterations})")
@@ -296,7 +401,26 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                     guided_grad_substitute=guided_grad_substitute,
                 )
             else:
-                slots, attn_vis = self.slot_iter(slots, k, v, token_mask=valid_token_mask)
+                compute_crf = bool(
+                    self.token_crf is not None
+                    and token_crf_context is not None
+                    and (self.token_crf_apply_every_iteration or is_last_iter)
+                )
+                apply_crf = bool(
+                    compute_crf
+                    and self.token_crf_mode != "off"
+                )
+                slots, attn_vis, iter_info = self.slot_iter(
+                    slots,
+                    k,
+                    v,
+                    token_mask=valid_token_mask,
+                    token_crf_context=token_crf_context,
+                    compute_crf=compute_crf,
+                    apply_crf=apply_crf,
+                )
+                if iter_info:
+                    last_iter_info = iter_info
 
         # Compute init loss for gaussian_pred mode: cosine distance between initial and final slots
         # This trains the MLP to predict initializations close to where slot attention converges
@@ -308,9 +432,30 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             cos_sim = F.cosine_similarity(slots_init, slots.detach(), dim=-1)  # [B, num_slots]
             init_loss = (1 - cos_sim).mean() * 0.0
 
-        return slots, attn_vis, init_loss
+        if not return_info:
+            return slots, attn_vis, init_loss
 
-    def slot_iter(self, slots, k, v, token_mask: Optional[torch.Tensor] = None):
+        info = {
+            "crf_enabled": self.token_crf is not None,
+            "raw_attn_vis": last_iter_info.get("raw_attn_vis", attn_vis),
+            "refined_attn_vis": last_iter_info.get("refined_attn_vis", None),
+            "effective_attn_vis": last_iter_info.get("effective_attn_vis", attn_vis),
+            "raw_assignments": last_iter_info.get("raw_assignments", None),
+            "refined_assignments": last_iter_info.get("refined_assignments", None),
+            "crf_stats": last_iter_info.get("crf_stats", {}),
+        }
+        return slots, attn_vis, init_loss, info
+
+    def slot_iter(
+        self,
+        slots,
+        k,
+        v,
+        token_mask: Optional[torch.Tensor] = None,
+        token_crf_context: Optional[TokenCRFContext] = None,
+        compute_crf: bool = False,
+        apply_crf: bool = False,
+    ):
         slots_prev = slots
         slots = self.norm_slots(slots)
 
@@ -327,11 +472,29 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             fill_value = torch.finfo(attn_logits.dtype).min
             attn_logits = attn_logits.masked_fill(~mask, fill_value)
         attn = F.softmax(rearrange(attn_logits, 'b h n_inp n_s -> b n_inp (h n_s)'), -1)
-        attn_vis = rearrange(attn, 'b n_inp (h n_s) -> b h n_inp n_s', h=self.num_heads)
+        raw_attn_vis = rearrange(attn, 'b n_inp (h n_s) -> b h n_inp n_s', h=self.num_heads)
         # `attn_vis` has shape: [batch_size, num_inputs, num_slots].
 
+        effective_attn_vis = raw_attn_vis
+        refined_attn_vis = None
+        raw_assignments = None
+        refined_assignments = None
+        crf_stats: dict[str, torch.Tensor] = {}
+        if compute_crf and token_crf_context is not None and self.token_crf is not None:
+            raw_assignments = self._attn_to_assignments(raw_attn_vis)
+            refinement = self.token_crf.refine(
+                raw_assignments,
+                token_crf_context,
+                token_mask=token_mask,
+            )
+            refined_assignments = refinement.refined_probs
+            refined_attn_vis = self._assignments_to_attn_vis(raw_attn_vis, refined_assignments)
+            crf_stats = refinement.stats
+            if apply_crf:
+                effective_attn_vis = self._apply_token_crf_mode(raw_attn_vis, refined_attn_vis)
+
         # Weighted mean.
-        attn = attn_vis + self.epsilon
+        attn = effective_attn_vis + self.epsilon
         attn = attn / torch.sum(attn, dim=-2, keepdim=True)  # norm over inputs
         updates = torch.einsum('...is,...id->...sd', attn,
                                v)  # Shape: [batch_size, num_heads, num_slots, num_inp].
@@ -345,7 +508,21 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
 
         slots = slots + self.mlp(self.norm_mlp(slots))
 
-        return slots, attn_vis
+        output_attn = (
+            effective_attn_vis
+            if apply_crf and self.token_crf_return_refined_attn
+            else raw_attn_vis
+        )
+        info = {
+            "raw_attn_vis": raw_attn_vis,
+            "refined_attn_vis": refined_attn_vis,
+            "effective_attn_vis": effective_attn_vis,
+            "raw_assignments": raw_assignments,
+            "refined_assignments": refined_assignments,
+            "crf_stats": crf_stats,
+        }
+
+        return slots, output_attn, info
 
     def slot_iter_guided(
         self,

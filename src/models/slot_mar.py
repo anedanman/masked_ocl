@@ -197,6 +197,8 @@ class _MARDecoderBlock(nn.Module):
 
 
 class SlotMARDecoder(nn.Module):
+    model_type: str = "mar"
+    uses_masking: bool = True
     requires_known_tokens: bool = False
     provides_per_slot_outputs: bool = False
 
@@ -531,6 +533,7 @@ class SlotMARDecoder(nn.Module):
         mask = mask_slots.any(dim=1)
         return mask
 
+    @torch.compiler.disable  # Dynamic shapes from data-dependent masking aren't compile-friendly
     def _select_indices(
         self,
         order: torch.Tensor,
@@ -607,6 +610,7 @@ class SlotMARDecoder(nn.Module):
         predict_mask: Optional[torch.Tensor] = None,
         known_tokens: Optional[torch.Tensor] = None,
         mask_ratio: Optional[float] = None,
+        mask_len: Optional[int] = None,
     ) -> SlotMAROutput:
         if feats.ndim != 4:
             raise ValueError(f"feats must have shape [B, C, H, W]; got {tuple(feats.shape)}")
@@ -628,8 +632,13 @@ class SlotMARDecoder(nn.Module):
                 raise ValueError(f"order must have shape {(bsz, num_tokens)}, got {tuple(order.shape)}")
 
         if mask is None:
-            ratio = float(mask_ratio) if mask_ratio is not None else self._sample_mask_ratio()
-            mask_len = int(max(1, min(num_tokens, math.ceil(num_tokens * ratio))))
+            # Use provided mask_len to avoid recompilation from varying mask_ratio
+            if mask_len is None:
+                ratio = float(mask_ratio) if mask_ratio is not None else self._sample_mask_ratio()
+                # Round up: ceil(num_tokens * ratio) = floor(num_tokens * ratio + 0.999...)
+                mask_len = max(1, min(num_tokens, int(num_tokens * ratio + 0.9999)))
+            else:
+                ratio = mask_len / num_tokens
             if self.masking_strategy == "slot_conditioned":
                 mask = self._slot_conditioned_mask(assignments, ratio=ratio, mask_len=mask_len)
             else:

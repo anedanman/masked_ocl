@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import math
 import os
@@ -11,6 +12,10 @@ logging.getLogger("torch._inductor").setLevel(logging.WARNING)
 
 # Suppress CUDA graph empty warnings (harmless but noisy with torch.compile)
 warnings.filterwarnings("ignore", message=".*CUDA Graph is empty.*")
+
+# Enable capturing scalar outputs to reduce graph breaks
+import torch._dynamo.config
+torch._dynamo.config.capture_scalar_outputs = True
 
 import torch
 import torch.nn as nn
@@ -43,9 +48,12 @@ except Exception:
 
 from src.training import (
     add_background_channel,
+    compute_distribution_matching_loss,
+    compute_mask_matching_loss,
     create_spot_metrics,
     flatten_metric_output,
     get_autocast_kwargs,
+    normalize_mask_matching_loss_type,
 )
 from src.utils import (
     load_config,
@@ -53,7 +61,7 @@ from src.utils import (
     attn_to_slot_masks,
     make_visual_grid,
     merge_instance_masks_by_category,
-    build_slot_mar_components,
+    build_slot_model_components,
     build_lr_scheduler,
     find_latest_checkpoint,
     save_checkpoint,
@@ -90,9 +98,57 @@ def _linear_ramp_schedule(
     return float(start + (end - start) * progress)
 
 
+def _resolve_mask_match_coeff(
+    mask_match_cfg: Dict[str, object],
+    loss_type: str,
+) -> float:
+    return _resolve_matching_coeff(mask_match_cfg, loss_type)
+
+
+def _resolve_matching_coeff(
+    loss_cfg: Dict[str, object],
+    loss_type: str,
+) -> float:
+    coeff_by_loss = loss_cfg.get("coeff_by_loss", None)
+    if coeff_by_loss is not None:
+        if not isinstance(coeff_by_loss, dict):
+            raise ValueError("coeff_by_loss must be a mapping.")
+        normalized = {
+            normalize_mask_matching_loss_type(name): value
+            for name, value in coeff_by_loss.items()
+        }
+        if loss_type in normalized:
+            return float(normalized[loss_type])
+    return float(loss_cfg.get("coeff", 1.0))
+
+
+def _resolve_scheduled_lambda(loss_cfg: Dict[str, object], *, default_end: float = 0.0) -> tuple[float, float, int, int]:
+    if "lambda" in loss_cfg:
+        value = float(loss_cfg.get("lambda", 0.0))
+        return value, value, 0, 0
+    start = float(loss_cfg.get("lambda_start", 0.0))
+    end = float(loss_cfg.get("lambda_end", default_end))
+    warmup = int(loss_cfg.get("lambda_warmup_steps", 0))
+    if "lambda_ramp_steps" in loss_cfg or "lambda_warmup_steps" in loss_cfg:
+        ramp = int(loss_cfg.get("lambda_ramp_steps", 0))
+    else:
+        ramp = int(loss_cfg.get("lambda_steps", 0))
+    return start, end, warmup, ramp
+
+
+def _scalarize_results(results: Dict[str, object]) -> Dict[str, float]:
+    scalars: Dict[str, float] = {}
+    for key, value in results.items():
+        if isinstance(value, (int, float)):
+            scalars[key] = float(value)
+        elif torch.is_tensor(value) and value.numel() == 1:
+            scalars[key] = float(value.item())
+    return scalars
+
+
 def main():
-    parser = argparse.ArgumentParser(description="MAR-style training for slot-based masked prediction.")
-    parser.add_argument("--config", type=str, default="configs/dinosaur_coco_mar.yaml", help="Path to YAML config")
+    parser = argparse.ArgumentParser(description="Training for slot-based MAR/AR decoders.")
+    parser.add_argument("--config", type=str, default="configs/mar_coco.yaml", help="Path to YAML config")
     parser.add_argument("--gpu", type=int, default=None, help="GPU index as shown in nvidia-smi (overrides config)")
     args = parser.parse_args()
 
@@ -112,6 +168,27 @@ def main():
     set_global_seed(seed_value, deterministic=deterministic_mode)
 
     out_dir = prepare_run_dir(cfg, args.config)
+    summary_path = os.path.join(out_dir, "train_summary.json")
+    latest_validation_summary: Optional[Dict[str, float]] = None
+
+    def write_training_summary(status: str) -> None:
+        payload: Dict[str, object] = {
+            "status": status,
+            "config_path": args.config,
+            "run_dir": out_dir,
+            "global_step": int(global_step),
+            "best_val_loss": float(best_val_loss) if math.isfinite(best_val_loss) else None,
+            "best_val_loss_step": int(best_val_loss_step),
+            "best_val_metrics_avg": (
+                float(best_val_metric_avg) if math.isfinite(best_val_metric_avg) else None
+            ),
+            "best_val_metrics_step": int(best_val_metric_step),
+            "crf_enabled": bool(cfg.get("crf", {}).get("enabled", False)),
+        }
+        if latest_validation_summary is not None:
+            payload["latest_validation"] = latest_validation_summary
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -123,7 +200,9 @@ def main():
     train_loader = loaders["train"]
     val_loader = loaders["val"]
 
-    dino, slot_attn, decoder, feat_dim = build_slot_mar_components(cfg, device)
+    dino, slot_attn, decoder, feat_dim = build_slot_model_components(cfg, device)
+    model_type = getattr(decoder, "model_type", "mar")
+    decoder_uses_masking = bool(getattr(decoder, "uses_masking", True))
     init_mode = cfg.get("slots", {}).get("init_mode", "gaussian")
     need_cls_token = init_mode == "gaussian_pred"
 
@@ -184,6 +263,10 @@ def main():
 
     mask_match_cfg = train_cfg.get("mask_matching", cfg.get("mask_matching", {})) or {}
     mask_match_enabled = bool(mask_match_cfg.get("enabled", True))
+    mask_match_loss_type = normalize_mask_matching_loss_type(
+        mask_match_cfg.get("loss_type", "bce")
+    )
+    mask_match_coeff = _resolve_mask_match_coeff(mask_match_cfg, mask_match_loss_type)
     if "lambda" in mask_match_cfg:
         mask_match_start = float(mask_match_cfg.get("lambda", 0.0))
         mask_match_end = mask_match_start
@@ -198,6 +281,40 @@ def main():
         else:
             mask_match_warmup_steps = 0
             mask_match_ramp_steps = int(mask_match_cfg.get("lambda_steps", 40000))
+
+    crf_cfg = cfg.get("crf", {}) or {}
+    crf_enabled = bool(crf_cfg.get("enabled", False))
+    crf_guidance_cfg = dict(crf_cfg.get("guidance", {}) or {})
+    sa_guidance_cfg = dict(
+        crf_guidance_cfg.get("slot_attention", crf_guidance_cfg.get("sa", {})) or {}
+    )
+    dec_guidance_cfg = dict(crf_guidance_cfg.get("decoder", {}) or {})
+
+    sa_guidance_enabled = crf_enabled and bool(sa_guidance_cfg.get("enabled", False))
+    sa_guidance_loss_type = normalize_mask_matching_loss_type(
+        sa_guidance_cfg.get("loss_type", "kl")
+    )
+    sa_guidance_coeff = _resolve_matching_coeff(sa_guidance_cfg, sa_guidance_loss_type)
+    (
+        sa_guidance_start,
+        sa_guidance_end,
+        sa_guidance_warmup_steps,
+        sa_guidance_ramp_steps,
+    ) = _resolve_scheduled_lambda(sa_guidance_cfg, default_end=0.05)
+    sa_guidance_target_detach = bool(sa_guidance_cfg.get("target_detach", True))
+
+    dec_guidance_enabled = crf_enabled and bool(dec_guidance_cfg.get("enabled", False))
+    dec_guidance_loss_type = normalize_mask_matching_loss_type(
+        dec_guidance_cfg.get("loss_type", "kl")
+    )
+    dec_guidance_coeff = _resolve_matching_coeff(dec_guidance_cfg, dec_guidance_loss_type)
+    (
+        dec_guidance_start,
+        dec_guidance_end,
+        dec_guidance_warmup_steps,
+        dec_guidance_ramp_steps,
+    ) = _resolve_scheduled_lambda(dec_guidance_cfg, default_end=0.05)
+    dec_guidance_target_detach = bool(dec_guidance_cfg.get("target_detach", True))
 
     sched_cfg = train_cfg.get("lr_schedule")
     if sched_cfg is None:
@@ -220,6 +337,8 @@ def main():
     best_val_loss_step = -1
     best_val_metric_avg = -float("inf")
     best_val_metric_step = -1
+
+    write_training_summary("running")
 
     dataset_type = data_cfg.get("dataset", "coco").lower()
     semantic_eval_enabled = dataset_type in ("coco", "voc") and train_cfg.get("eval_semantic_metrics", True)
@@ -273,6 +392,7 @@ def main():
                 ema_params = create_ema_params([slot_attn, decoder])
         global_step = int(ckpt.get("global_step", 0))
         print(f"Resumed from {resume_path} at step {global_step}.")
+        write_training_summary("running")
 
     train_iter = iter(train_loader)
     grad_clip = train_cfg.get("grad_clip_norm", train_cfg.get("grad_clip", None))
@@ -298,10 +418,19 @@ def main():
         loss_log_total = 0.0
         mask_match_loss_total = 0.0
         mask_match_loss_count = 0
+        sa_guidance_loss_total = 0.0
+        sa_guidance_loss_count = 0
+        dec_guidance_loss_total = 0.0
+        dec_guidance_loss_count = 0
+        crf_stat_totals: Dict[str, float] = {}
+        crf_stat_count = 0
         mask_ratio_total = 0.0
+        random_order_prob_total = 0.0
+        random_order_frac_total = 0.0
+        random_order_measure_count = 0
         last_batch_for_viz = None
 
-        mask_match_lambda = (
+        base_mask_match_lambda = (
             _linear_ramp_schedule(
                 global_step,
                 start=mask_match_start,
@@ -312,6 +441,31 @@ def main():
             if mask_match_enabled
             else 0.0
         )
+        mask_match_lambda = base_mask_match_lambda * mask_match_coeff
+        base_sa_guidance_lambda = (
+            _linear_ramp_schedule(
+                global_step,
+                start=sa_guidance_start,
+                end=sa_guidance_end,
+                warmup_steps=sa_guidance_warmup_steps,
+                ramp_steps=sa_guidance_ramp_steps,
+            )
+            if sa_guidance_enabled
+            else 0.0
+        )
+        sa_guidance_lambda = base_sa_guidance_lambda * sa_guidance_coeff
+        base_dec_guidance_lambda = (
+            _linear_ramp_schedule(
+                global_step,
+                start=dec_guidance_start,
+                end=dec_guidance_end,
+                warmup_steps=dec_guidance_warmup_steps,
+                ramp_steps=dec_guidance_ramp_steps,
+            )
+            if dec_guidance_enabled
+            else 0.0
+        )
+        dec_guidance_lambda = base_dec_guidance_lambda * dec_guidance_coeff
 
         for _ in range(grad_accum_steps):
             try:
@@ -325,10 +479,6 @@ def main():
             if gt_masks is not None:
                 gt_masks = gt_masks.to(device, non_blocking=True)
 
-            # Pre-sample mask_ratio outside compiled region to avoid recompilation
-            # The decoder's _sample_mask_ratio uses .item() which causes graph breaks
-            mask_ratio = decoder._sample_mask_ratio()
-
             with torch.autocast(**autocast_kwargs):
                 if need_cls_token:
                     feats, cls_token = extract_features(images, dino, return_cls_token=True)
@@ -336,9 +486,37 @@ def main():
                     feats = extract_features(images, dino)
                     cls_token = None
                 B, D, Hf, Wf = feats.shape
+                num_tokens = Hf * Wf
 
-                slots, attn_vis, init_loss = slot_attn(feats, cls_token=cls_token)
-                output = decoder(feats, slots, attn_vis, mask_ratio=mask_ratio)
+                slot_info = None
+                if crf_enabled:
+                    slots, attn_vis, init_loss, slot_info = slot_attn(
+                        feats,
+                        cls_token=cls_token,
+                        return_info=True,
+                    )
+                else:
+                    slots, attn_vis, init_loss = slot_attn(feats, cls_token=cls_token)
+                if decoder_uses_masking:
+                    # Pre-compute the sampled ratio outside the decoder to avoid
+                    # recompilation from passing a fresh Python float into a compiled module.
+                    mask_ratio = decoder._sample_mask_ratio()
+                    mask_len = max(1, min(num_tokens, int(num_tokens * mask_ratio + 0.9999)))
+                    output = decoder(feats, slots, attn_vis, mask_len=mask_len)
+                else:
+                    if hasattr(decoder, "sample_training_order"):
+                        order, order_is_random, random_order_prob = decoder.sample_training_order(
+                            B,
+                            num_tokens,
+                            device,
+                            global_step,
+                        )
+                        random_order_prob_total += float(random_order_prob)
+                        random_order_frac_total += float(order_is_random.float().mean().item())
+                        random_order_measure_count += 1
+                    else:
+                        order = decoder._sample_orders(B, num_tokens, device=device)
+                    output = decoder(feats, slots, attn_vis, order=order)
                 gt_pred = _gather_gt_tokens(feats, output.pred_indices)
                 loss = F.mse_loss(output.predictions, gt_pred)
                 if init_loss is not None:
@@ -346,6 +524,20 @@ def main():
                 dec_masks = output.decoder_masks
                 if dec_masks is not None and dec_masks.shape[1] != slots.shape[1]:
                     dec_masks = dec_masks[:, : slots.shape[1]]
+
+                raw_slot_assignments = None
+                refined_slot_assignments = None
+                if slot_info is not None:
+                    raw_slot_assignments = slot_info.get("raw_assignments", None)
+                    refined_slot_assignments = slot_info.get("refined_assignments", None)
+                    crf_stats = slot_info.get("crf_stats", {}) or {}
+                    if crf_stats:
+                        for stat_name, stat_value in crf_stats.items():
+                            crf_stat_totals[stat_name] = crf_stat_totals.get(stat_name, 0.0) + float(
+                                stat_value.detach().item()
+                            )
+                        crf_stat_count += 1
+
                 if mask_match_enabled and dec_masks is not None:
                     sa_masks = attn_to_slot_masks(attn_vis, Hf, Wf)
                     dec_masks_for_loss = dec_masks.squeeze(2)
@@ -354,18 +546,65 @@ def main():
                         sa_masks = sa_masks[:, :min_slots]
                         dec_masks_for_loss = dec_masks_for_loss[:, :min_slots]
                     with torch.autocast(device_type=device.type, enabled=False):
-                        mask_match_loss = F.binary_cross_entropy(
-                            dec_masks_for_loss.float(),
-                            sa_masks.float(),
+                        mask_match_loss = compute_mask_matching_loss(
+                            dec_masks_for_loss,
+                            sa_masks,
+                            loss_type=mask_match_loss_type,
                         )
                     mask_match_loss_total += float(mask_match_loss.detach().item())
                     mask_match_loss_count += 1
                     if mask_match_lambda != 0.0:
                         loss = loss + mask_match_lambda * mask_match_loss
 
+                if (
+                    sa_guidance_enabled
+                    and raw_slot_assignments is not None
+                    and refined_slot_assignments is not None
+                ):
+                    sa_target = (
+                        refined_slot_assignments.detach()
+                        if sa_guidance_target_detach
+                        else refined_slot_assignments
+                    )
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        sa_guidance_loss = compute_distribution_matching_loss(
+                            raw_slot_assignments,
+                            sa_target,
+                            loss_type=sa_guidance_loss_type,
+                            normalize_dim=-1,
+                        )
+                    sa_guidance_loss_total += float(sa_guidance_loss.detach().item())
+                    sa_guidance_loss_count += 1
+                    if sa_guidance_lambda != 0.0:
+                        loss = loss + sa_guidance_lambda * sa_guidance_loss
+
+                if (
+                    dec_guidance_enabled
+                    and dec_masks is not None
+                    and refined_slot_assignments is not None
+                ):
+                    crf_masks = refined_slot_assignments.permute(0, 2, 1).contiguous().view(B, -1, Hf, Wf)
+                    dec_masks_for_guidance = dec_masks.squeeze(2)
+                    if crf_masks.shape[1] != dec_masks_for_guidance.shape[1]:
+                        min_slots = min(crf_masks.shape[1], dec_masks_for_guidance.shape[1])
+                        crf_masks = crf_masks[:, :min_slots]
+                        dec_masks_for_guidance = dec_masks_for_guidance[:, :min_slots]
+                    dec_target = crf_masks.detach() if dec_guidance_target_detach else crf_masks
+                    with torch.autocast(device_type=device.type, enabled=False):
+                        dec_guidance_loss = compute_mask_matching_loss(
+                            dec_masks_for_guidance,
+                            dec_target,
+                            loss_type=dec_guidance_loss_type,
+                        )
+                    dec_guidance_loss_total += float(dec_guidance_loss.detach().item())
+                    dec_guidance_loss_count += 1
+                    if dec_guidance_lambda != 0.0:
+                        loss = loss + dec_guidance_lambda * dec_guidance_loss
+
             (loss / grad_accum_steps).backward()
             loss_log_total += float(loss.detach().item())
-            mask_ratio_total += float(output.mask.float().mean().item())
+            if decoder_uses_masking:
+                mask_ratio_total += float(output.mask.float().mean().item())
 
             if log_train_images:
                 last_batch_for_viz = {
@@ -395,23 +634,71 @@ def main():
 
         current_lr = float(optim.param_groups[0]["lr"])
         avg_train_loss = loss_log_total / grad_accum_steps
-        avg_mask_ratio = mask_ratio_total / grad_accum_steps
+        avg_mask_ratio = mask_ratio_total / grad_accum_steps if decoder_uses_masking else None
+        avg_random_order_prob = (
+            random_order_prob_total / random_order_measure_count
+            if random_order_measure_count > 0
+            else None
+        )
+        avg_random_order_frac = (
+            random_order_frac_total / random_order_measure_count
+            if random_order_measure_count > 0
+            else None
+        )
         avg_mask_match_loss = (
             mask_match_loss_total / mask_match_loss_count
             if mask_match_loss_count > 0
             else None
+        )
+        avg_sa_guidance_loss = (
+            sa_guidance_loss_total / sa_guidance_loss_count
+            if sa_guidance_loss_count > 0
+            else None
+        )
+        avg_dec_guidance_loss = (
+            dec_guidance_loss_total / dec_guidance_loss_count
+            if dec_guidance_loss_count > 0
+            else None
+        )
+        avg_crf_stats = (
+            {name: total / crf_stat_count for name, total in crf_stat_totals.items()}
+            if crf_stat_count > 0
+            else {}
         )
 
         if use_wandb and (global_step % log_every == 0):
             log_dict = {
                 "train/loss": avg_train_loss,
                 "train/lr": current_lr,
-                "train/mask_ratio": avg_mask_ratio,
             }
+            if avg_mask_ratio is not None:
+                log_dict["train/mask_ratio"] = avg_mask_ratio
+            if avg_random_order_prob is not None:
+                log_dict["train/random_order_prob"] = avg_random_order_prob
+            if avg_random_order_frac is not None:
+                log_dict["train/random_order_fraction"] = avg_random_order_frac
             if mask_match_enabled:
+                log_dict["train/mask_match_coeff"] = mask_match_coeff
+                log_dict["train/mask_match_lambda_base"] = base_mask_match_lambda
                 log_dict["train/mask_match_lambda"] = mask_match_lambda
                 if avg_mask_match_loss is not None:
                     log_dict["train/mask_match_loss"] = avg_mask_match_loss
+            if crf_enabled:
+                log_dict["train/crf_enabled"] = 1.0
+                for stat_name, stat_value in avg_crf_stats.items():
+                    log_dict[f"train/crf/{stat_name}"] = stat_value
+            if sa_guidance_enabled:
+                log_dict["train/crf_slot_guidance_coeff"] = sa_guidance_coeff
+                log_dict["train/crf_slot_guidance_lambda_base"] = base_sa_guidance_lambda
+                log_dict["train/crf_slot_guidance_lambda"] = sa_guidance_lambda
+                if avg_sa_guidance_loss is not None:
+                    log_dict["train/crf_slot_guidance_loss"] = avg_sa_guidance_loss
+            if dec_guidance_enabled:
+                log_dict["train/crf_decoder_guidance_coeff"] = dec_guidance_coeff
+                log_dict["train/crf_decoder_guidance_lambda_base"] = base_dec_guidance_lambda
+                log_dict["train/crf_decoder_guidance_lambda"] = dec_guidance_lambda
+                if avg_dec_guidance_loss is not None:
+                    log_dict["train/crf_decoder_guidance_loss"] = avg_dec_guidance_loss
             if grad_norm is not None:
                 log_dict["train/grad_norm"] = grad_norm
 
@@ -443,12 +730,35 @@ def main():
             log_dict = {
                 "train/loss": avg_train_loss,
                 "train/lr": current_lr,
-                "train/mask_ratio": avg_mask_ratio,
             }
+            if avg_mask_ratio is not None:
+                log_dict["train/mask_ratio"] = avg_mask_ratio
+            if avg_random_order_prob is not None:
+                log_dict["train/random_order_prob"] = avg_random_order_prob
+            if avg_random_order_frac is not None:
+                log_dict["train/random_order_fraction"] = avg_random_order_frac
             if mask_match_enabled:
+                log_dict["train/mask_match_coeff"] = mask_match_coeff
+                log_dict["train/mask_match_lambda_base"] = base_mask_match_lambda
                 log_dict["train/mask_match_lambda"] = mask_match_lambda
                 if avg_mask_match_loss is not None:
                     log_dict["train/mask_match_loss"] = avg_mask_match_loss
+            if crf_enabled:
+                log_dict["train/crf_enabled"] = 1.0
+                for stat_name, stat_value in avg_crf_stats.items():
+                    log_dict[f"train/crf/{stat_name}"] = stat_value
+            if sa_guidance_enabled:
+                log_dict["train/crf_slot_guidance_coeff"] = sa_guidance_coeff
+                log_dict["train/crf_slot_guidance_lambda_base"] = base_sa_guidance_lambda
+                log_dict["train/crf_slot_guidance_lambda"] = sa_guidance_lambda
+                if avg_sa_guidance_loss is not None:
+                    log_dict["train/crf_slot_guidance_loss"] = avg_sa_guidance_loss
+            if dec_guidance_enabled:
+                log_dict["train/crf_decoder_guidance_coeff"] = dec_guidance_coeff
+                log_dict["train/crf_decoder_guidance_lambda_base"] = base_dec_guidance_lambda
+                log_dict["train/crf_decoder_guidance_lambda"] = dec_guidance_lambda
+                if avg_dec_guidance_loss is not None:
+                    log_dict["train/crf_decoder_guidance_loss"] = avg_dec_guidance_loss
             if grad_norm is not None:
                 log_dict["train/grad_norm"] = grad_norm
             wandb.log(log_dict, step=global_step)
@@ -490,6 +800,10 @@ def main():
                         metric.reset()
 
                 val_losses: List[float] = []
+                val_sa_guidance_losses: List[float] = []
+                val_dec_guidance_losses: List[float] = []
+                val_crf_stat_totals: Dict[str, float] = {}
+                val_crf_stat_count = 0
                 viz_grids: List[torch.Tensor] = []
                 viz_target = int(cfg.get("wandb", {}).get("val_viz_count", 16)) if use_wandb else 0
                 target_metrics_active: Dict[str, bool] = {name: False for name in metrics_val}
@@ -515,13 +829,24 @@ def main():
                             feats = extract_features(images, dino)
                             cls_token = None
                         B, D, Hf, Wf = feats.shape
-                        slots, attn_vis, _ = slot_attn(feats, cls_token=cls_token)
+                        slot_info = None
+                        if crf_enabled:
+                            slots, attn_vis, _, slot_info = slot_attn(
+                                feats,
+                                cls_token=cls_token,
+                                return_info=True,
+                            )
+                        else:
+                            slots, attn_vis, _ = slot_attn(feats, cls_token=cls_token)
                         if val_iterative:
+                            iterative_steps = val_iterative_steps
+                            if model_type == "ar" and not val_iterative_teacher_force:
+                                iterative_steps = Hf * Wf
                             recon, iter_masks = decoder.iterative_predict(
                                 feats,
                                 slots,
                                 attn_vis,
-                                num_steps=val_iterative_steps,
+                                num_steps=iterative_steps,
                                 teacher_force=val_iterative_teacher_force,
                                 parallel_teacher_force=val_iterative_parallel,
                                 return_decoder_masks=True,
@@ -535,6 +860,54 @@ def main():
                             dec_masks = output.decoder_masks
                         if dec_masks is not None and dec_masks.shape[1] != slots.shape[1]:
                             dec_masks = dec_masks[:, : slots.shape[1]]
+
+                    if slot_info is not None:
+                        raw_slot_assignments = slot_info.get("raw_assignments", None)
+                        refined_slot_assignments = slot_info.get("refined_assignments", None)
+                        crf_stats = slot_info.get("crf_stats", {}) or {}
+                        if crf_stats:
+                            for stat_name, stat_value in crf_stats.items():
+                                val_crf_stat_totals[stat_name] = val_crf_stat_totals.get(stat_name, 0.0) + float(
+                                    stat_value.detach().item()
+                                )
+                            val_crf_stat_count += 1
+
+                        if (
+                            sa_guidance_enabled
+                            and raw_slot_assignments is not None
+                            and refined_slot_assignments is not None
+                        ):
+                            sa_target = (
+                                refined_slot_assignments.detach()
+                                if sa_guidance_target_detach
+                                else refined_slot_assignments
+                            )
+                            sa_loss_val = compute_distribution_matching_loss(
+                                raw_slot_assignments,
+                                sa_target,
+                                loss_type=sa_guidance_loss_type,
+                                normalize_dim=-1,
+                            )
+                            val_sa_guidance_losses.append(float(sa_loss_val.item()))
+
+                        if (
+                            dec_guidance_enabled
+                            and dec_masks is not None
+                            and refined_slot_assignments is not None
+                        ):
+                            crf_masks = refined_slot_assignments.permute(0, 2, 1).contiguous().view(B, -1, Hf, Wf)
+                            dec_masks_for_guidance = dec_masks.squeeze(2)
+                            if crf_masks.shape[1] != dec_masks_for_guidance.shape[1]:
+                                min_slots = min(crf_masks.shape[1], dec_masks_for_guidance.shape[1])
+                                crf_masks = crf_masks[:, :min_slots]
+                                dec_masks_for_guidance = dec_masks_for_guidance[:, :min_slots]
+                            dec_target = crf_masks.detach() if dec_guidance_target_detach else crf_masks
+                            dec_loss_val = compute_mask_matching_loss(
+                                dec_masks_for_guidance,
+                                dec_target,
+                                loss_type=dec_guidance_loss_type,
+                            )
+                            val_dec_guidance_losses.append(float(dec_loss_val.item()))
 
                     sa_masks = attn_to_slot_masks(attn_vis, Hf, Wf)
                     sa_masks_img = F.interpolate(sa_masks, size=images.shape[-2:], mode="bilinear")
@@ -575,6 +948,17 @@ def main():
 
                 val_loss = float(sum(val_losses) / len(val_losses)) if val_losses else float("nan")
                 results = {"val/loss": val_loss}
+                if val_sa_guidance_losses:
+                    results["val/crf_slot_guidance_loss"] = float(
+                        sum(val_sa_guidance_losses) / len(val_sa_guidance_losses)
+                    )
+                if val_dec_guidance_losses:
+                    results["val/crf_decoder_guidance_loss"] = float(
+                        sum(val_dec_guidance_losses) / len(val_dec_guidance_losses)
+                    )
+                if val_crf_stat_count > 0:
+                    for stat_name, total in val_crf_stat_totals.items():
+                        results[f"val/crf/{stat_name}"] = float(total / val_crf_stat_count)
                 metric_values_for_avg: List[float] = []
 
                 for target_name, metric_group in metrics_val.items():
@@ -615,7 +999,8 @@ def main():
 
                 if use_wandb:
                     if viz_grids:
-                        results["val/viz"] = wandb.Image(torch.stack(viz_grids))
+                        val_viz_grid = torchvision.utils.make_grid(viz_grids, nrow=4, padding=8)
+                        results["val/viz"] = wandb.Image(val_viz_grid, caption="validation_grids")
                     wandb.log(results, step=global_step)
 
                 if math.isfinite(val_loss) and val_loss < best_val_loss:
@@ -636,6 +1021,9 @@ def main():
                         f"Saved new best metric checkpoint at step {global_step} (val/metrics_avg={metric_avg:.2f})."
                     )
 
+                latest_validation_summary = _scalarize_results(results)
+                write_training_summary("running")
+
             # Restore original weights after EMA validation
             if use_ema_for_val and original_params_backup is not None:
                 restore_model_params(original_params_backup, [slot_attn, decoder])
@@ -649,6 +1037,7 @@ def main():
         print(f"Best validation loss: step {best_val_loss_step} (val_loss={best_val_loss:.6f})")
     if best_val_metric_step >= 0 and math.isfinite(best_val_metric_avg):
         print(f"Best validation metrics avg: step {best_val_metric_step} (val/metrics_avg={best_val_metric_avg:.2f})")
+    write_training_summary("completed")
 
 
 if __name__ == "__main__":

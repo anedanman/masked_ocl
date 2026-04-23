@@ -1,5 +1,8 @@
 # Datasets (all forlders inside data/)
 data/*/
+wandb/*/
+dinov3_ckpts/
+wandb_key.txt
 
 # Generated config files 
 configs/generated/*

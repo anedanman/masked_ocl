@@ -1,5 +1,5 @@
 train:
-  max_updates: 100002
+  max_updates: 200002
   val_every_updates: 10000
   log_every_updates: 500
   val_iterative: false
@@ -10,11 +10,11 @@ train:
   seed: 39
   deterministic: false
   compile:
-    enabled: false
+    enabled: true
     mode: reduce-overhead
     fullgraph: false
   batch_size: 64
-  val_batch_size: 32
+  val_batch_size: 64
   gradient_accumulation_steps: 1
   num_workers: 16
   val_num_workers: 4
@@ -24,10 +24,10 @@ train:
   images_only: true
   return_properties: false
   max_samples_train: null
-  max_samples_val: null
+  max_samples_val: 2000
   max_val_batches: 20
   grad_clip_norm: 1.0
-  learning_rate: 1.2e-4
+  learning_rate: 1.5e-4
   weight_decay: 1.0e-4
   lr_schedule:
     type: cosine
@@ -41,39 +41,39 @@ train:
     every_updates: 10000
     keep_last: 1
     resume_path: null
-    resume_latest: true
+    resume_latest: false
   amp: true
   amp_dtype: "bfloat16"
   dino_cache:
     enabled: false
-    dir: ./data/MOVi/dino_cache_c
+    dir: ./data/coco/dino_cache
     skip_image_loading: true
     backend: lmdb
-    lmdb_map_size_gb: 64
+    lmdb_map_size_gb: 256
 
 data:
-  dataset: movi_c
-  root: ./data/MOVi
-  level: c
+  dataset: coco
+  root: ./data/coco
   image_size: 256
-  max_objects: 11
-  frames_per_clip: 24
+  max_objects: 60
+  train_split: train2017
+  val_split: val2017
+  min_area: 0.0
   train_horizontal_flip_prob: 0.5
 
-
 dino:
-  size: b
+  size: l
   freeze: true
   compile: false
 
 slots:
   num_iterations: 5
-  num_slots: 11
+  num_slots: 7
   num_heads: 1
-  slot_size: 512
+  slot_size: 768
   input_size: null
   out_size: null
-  mlp_hidden_size: 2048
+  mlp_hidden_size: 3072
   truncate: fixed-point
   qk_rmsnorm: false
   qk_rmsnorm_eps: 1.0e-6
@@ -82,14 +82,14 @@ slots:
   kmeans_iters: 10
 
 mar:
-  model_dim: 768
+  model_dim: 1024
   encoder_depth: 0
   decoder_depth: 4
-  num_heads: 6
-  mlp_hidden_dim: 3072
-  slot_cross_mlp: false
+  num_heads: 8
+  mlp_hidden_dim: 4096
+  slot_cross_mlp: true
   dropout: 0.0
-  self_attn_type: full
+  self_attn_type: full # 'full' or 'causal'
   prediction_order: random
   predict_tokens: null
   buffer_size: 64
@@ -102,29 +102,29 @@ mar:
   add_pos_to_known: false
   qk_norm: false
   use_bos_token: true
-  pos_embed_type: mlp
-  max_seq_len: 256
+  pos_embed_type: mlp  # 'learned' (like original MAR) or 'mlp'
+  max_seq_len: 256  # max sequence length for learned positional embeddings
 
 masking:
-  strategy: order
+  strategy: order  # 'order' or 'slot_conditioned'
   ratio_min: 0.7
   ratio_max: 1.0
-  ratio_mode: uniform
-  ratio_std: 0.25
+  ratio_mode: uniform  # 'truncated_gaussian' (like original MAR) or 'uniform'
+  ratio_std: 0.25  # std dev for truncated Gaussian (centered at ratio_max)
 
 mask_matching:
   enabled: true
   loss_type: bce  # bce | soft_ce | kl
   lambda_start: 0.0
-  lambda_end: 0.015
+  lambda_end: 0.1
   lambda_warmup_steps: 0
   lambda_ramp_steps: 40000
 
 wandb:
   enabled: true
-  project: slot-mar
+  project: slot-dino
   entity: null
-  run_name: mar_movi_c
+  run_name: mar_coco_mask0.7_1.0_Ldino_crossmlp_lr1.5e-4_noenc_64bs
   mode: online
 
 output:

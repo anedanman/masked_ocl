@@ -1,4 +1,5 @@
 from xml.parsers.expat import model
+from dataclasses import dataclass
 import math
 import os
 import random
@@ -27,28 +28,321 @@ except Exception:  # pragma: no cover
     torchvision = None
 
 
-def load_dino_model(size: str = "s", device: str = "cuda") -> torch.nn.Module:
-    """
-    Loads a pretrained DINO model.
+@dataclass(frozen=True)
+class DinoBackboneSpec:
+    family: str
+    variant: str
+    feature_stride: int
+    image_multiple: int
+    extractor_kind: str
 
-    Args:
-        size (str): Size of the DINO model to load. Options are "s", "b", or "l".
-        device (str): Device to load the model onto. Default is "cuda".
 
-    Returns:
-        torch.nn.Module: Loaded DINO model.
-    """
-    size2ckpt = {
-        "s": "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
-        "b": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-        "l": "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+_DINO_V3_VARIANTS: Dict[str, DinoBackboneSpec] = {
+    "vits16": DinoBackboneSpec("dinov3", "vits16", feature_stride=16, image_multiple=16, extractor_kind="forward_features"),
+    "vitb16": DinoBackboneSpec("dinov3", "vitb16", feature_stride=16, image_multiple=16, extractor_kind="forward_features"),
+    "vitl16": DinoBackboneSpec("dinov3", "vitl16", feature_stride=16, image_multiple=16, extractor_kind="forward_features"),
+}
+
+_DINO_V2_VARIANTS: Dict[str, DinoBackboneSpec] = {
+    "vits14": DinoBackboneSpec("dinov2", "vits14", feature_stride=14, image_multiple=14, extractor_kind="forward_features"),
+    "vitb14": DinoBackboneSpec("dinov2", "vitb14", feature_stride=14, image_multiple=14, extractor_kind="forward_features"),
+}
+
+_DINO_V1_VARIANTS: Dict[str, DinoBackboneSpec] = {
+    "vitb16": DinoBackboneSpec("dino", "vitb16", feature_stride=16, image_multiple=16, extractor_kind="dino_v1_vit"),
+    "vitb8": DinoBackboneSpec("dino", "vitb8", feature_stride=8, image_multiple=8, extractor_kind="dino_v1_vit"),
+    "resnet50": DinoBackboneSpec("dino", "resnet50", feature_stride=32, image_multiple=1, extractor_kind="dino_v1_resnet50"),
+}
+
+_DINO_V3_SIZE_ALIASES = {
+    "s": "vits16",
+    "small": "vits16",
+    "b": "vitb16",
+    "base": "vitb16",
+    "l": "vitl16",
+    "large": "vitl16",
+}
+
+_DINO_FAMILY_ALIASES = {
+    "1": "dino",
+    "v1": "dino",
+    "dinov1": "dino",
+    "dino": "dino",
+    "2": "dinov2",
+    "v2": "dinov2",
+    "dinov2": "dinov2",
+    "3": "dinov3",
+    "v3": "dinov3",
+    "dinov3": "dinov3",
+    "dino3": "dinov3",
+}
+
+_DINO_V1_ALIAS_MAP = {
+    "b": "vitb16",
+    "base": "vitb16",
+    "vitb": "vitb16",
+    "vitb16": "vitb16",
+    "vitb8": "vitb8",
+    "b8": "vitb8",
+    "resnet50": "resnet50",
+    "resnet-50": "resnet50",
+    "r50": "resnet50",
+}
+
+_DINO_V2_ALIAS_MAP = {
+    "s": "vits14",
+    "small": "vits14",
+    "vits": "vits14",
+    "vits14": "vits14",
+    "b": "vitb14",
+    "base": "vitb14",
+    "vitb": "vitb14",
+    "vitb14": "vitb14",
+}
+
+_DINO_V3_ALIAS_MAP = {
+    **_DINO_V3_SIZE_ALIASES,
+    "vits": "vits16",
+    "vits16": "vits16",
+    "vitb": "vitb16",
+    "vitb16": "vitb16",
+    "vitl": "vitl16",
+    "vitl16": "vitl16",
+}
+
+
+class DinoBackboneAdapter(nn.Module):
+    def __init__(self, model: nn.Module, spec: DinoBackboneSpec):
+        super().__init__()
+        self.model = model
+        self.spec = spec
+        self.family = spec.family
+        self.variant = spec.variant
+        self.feature_stride = int(spec.feature_stride)
+        self.image_multiple = int(spec.image_multiple)
+
+    def _validate_input_size(self, images: torch.Tensor) -> Tuple[int, int]:
+        height = int(images.shape[-2])
+        width = int(images.shape[-1])
+        multiple = int(self.image_multiple)
+        if multiple > 1 and ((height % multiple) != 0 or (width % multiple) != 0):
+            raise ValueError(
+                f"{self.family}/{self.variant} requires image height and width to be multiples of "
+                f"{multiple}, but got {(height, width)}."
+            )
+        return height, width
+
+    def forward_features(self, images: torch.Tensor) -> Dict[str, Any]:
+        height, width = self._validate_input_size(images)
+
+        if self.spec.extractor_kind == "forward_features":
+            out = self.model.forward_features(images)
+            patch_tokens = out["x_norm_patchtokens"]
+            h_tokens = height // self.feature_stride
+            w_tokens = width // self.feature_stride
+            if patch_tokens.shape[1] != h_tokens * w_tokens:
+                raise RuntimeError(
+                    f"{self.family}/{self.variant} returned {patch_tokens.shape[1]} patch tokens, "
+                    f"but expected {h_tokens * w_tokens} from input {(height, width)} "
+                    f"and stride {self.feature_stride}."
+                )
+            return {
+                "x_norm_patchtokens": patch_tokens,
+                "x_norm_clstoken": out.get("x_norm_clstoken", None),
+                "spatial_shape": (h_tokens, w_tokens),
+            }
+
+        if self.spec.extractor_kind == "dino_v1_vit":
+            tokens = self.model.get_intermediate_layers(images, n=1)[0]
+            patch_tokens = tokens[:, 1:]
+            h_tokens = height // self.feature_stride
+            w_tokens = width // self.feature_stride
+            if patch_tokens.shape[1] != h_tokens * w_tokens:
+                raise RuntimeError(
+                    f"{self.family}/{self.variant} returned {patch_tokens.shape[1]} patch tokens, "
+                    f"but expected {h_tokens * w_tokens} from input {(height, width)} "
+                    f"and stride {self.feature_stride}."
+                )
+            return {
+                "x_norm_patchtokens": patch_tokens,
+                "x_norm_clstoken": tokens[:, 0],
+                "spatial_shape": (h_tokens, w_tokens),
+            }
+
+        if self.spec.extractor_kind == "dino_v1_resnet50":
+            x = images
+            x = self.model.conv1(x)
+            x = self.model.bn1(x)
+            x = self.model.relu(x)
+            x = self.model.maxpool(x)
+            x = self.model.layer1(x)
+            x = self.model.layer2(x)
+            x = self.model.layer3(x)
+            x = self.model.layer4(x)
+            return {
+                "x_norm_patchtokens": x.flatten(2).transpose(1, 2).contiguous(),
+                "x_norm_clstoken": x.mean(dim=(2, 3)),
+                "spatial_shape": (int(x.shape[-2]), int(x.shape[-1])),
+            }
+
+        raise ValueError(f"Unsupported extractor kind '{self.spec.extractor_kind}'.")
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+
+def _normalize_dino_token(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    token = str(value).strip().lower()
+    token = token.replace("_", "").replace("/", "").replace(" ", "")
+    return token or None
+
+
+def _resolve_dino_variant_from_alias(alias_map: Dict[str, str], token: Optional[str]) -> Optional[str]:
+    if token is None:
+        return None
+    if token in alias_map:
+        return alias_map[token]
+    return None
+
+
+def resolve_dino_backbone_spec(dino_cfg: Optional[Dict[str, Any]] = None) -> DinoBackboneSpec:
+    dino_cfg = dict(dino_cfg or {})
+
+    raw_family = dino_cfg.get("version", dino_cfg.get("family", None))
+    family = _DINO_FAMILY_ALIASES.get(str(raw_family).strip().lower(), None) if raw_family is not None else None
+
+    raw_variant = dino_cfg.get("variant", None)
+    normalized_variant = _normalize_dino_token(raw_variant)
+    normalized_size = _normalize_dino_token(dino_cfg.get("size", None))
+
+    if family is None and normalized_variant is not None:
+        for alias_map, candidate_family in (
+            (_DINO_V1_ALIAS_MAP, "dino"),
+            (_DINO_V2_ALIAS_MAP, "dinov2"),
+            (_DINO_V3_ALIAS_MAP, "dinov3"),
+        ):
+            resolved = _resolve_dino_variant_from_alias(alias_map, normalized_variant)
+            if resolved is not None:
+                family = candidate_family
+                break
+
+    if family is None:
+        family = "dinov3"
+
+    if family == "dino":
+        canonical_variant = (
+            _resolve_dino_variant_from_alias(_DINO_V1_ALIAS_MAP, normalized_variant)
+            or _resolve_dino_variant_from_alias(_DINO_V1_ALIAS_MAP, normalized_size)
+        )
+        if canonical_variant is None:
+            raise ValueError(
+                "Unsupported DINO v1 backbone. Use one of: vitb16, vitb8, resnet50."
+            )
+        return _DINO_V1_VARIANTS[canonical_variant]
+
+    if family == "dinov2":
+        if normalized_variant in {"vitb8", "b8"} or normalized_size in {"vitb8", "b8"}:
+            raise ValueError(
+                "Official DINOv2 does not provide a ViT-B/8 hub backbone. "
+                "Use DINO v1 with dino.version: v1 and dino.variant: vitb8 instead."
+            )
+        canonical_variant = (
+            _resolve_dino_variant_from_alias(_DINO_V2_ALIAS_MAP, normalized_variant)
+            or _resolve_dino_variant_from_alias(_DINO_V2_ALIAS_MAP, normalized_size)
+        )
+        if canonical_variant is None:
+            raise ValueError(
+                "Unsupported DINOv2 backbone. Use one of: vits14, vitb14."
+            )
+        return _DINO_V2_VARIANTS[canonical_variant]
+
+    if family == "dinov3":
+        canonical_variant = (
+            _resolve_dino_variant_from_alias(_DINO_V3_ALIAS_MAP, normalized_variant)
+            or _resolve_dino_variant_from_alias(_DINO_V3_ALIAS_MAP, normalized_size)
+        )
+        if canonical_variant is None:
+            raise ValueError(
+                "Unsupported DINOv3 backbone. Use one of: vits16, vitb16, vitl16 "
+                "or the legacy size aliases s, b, l."
+            )
+        return _DINO_V3_VARIANTS[canonical_variant]
+
+    raise ValueError(f"Unsupported DINO family '{family}'.")
+
+
+def _load_dinov3_local_model(spec: DinoBackboneSpec, dino_cfg: Dict[str, Any]) -> nn.Module:
+    variant_to_ckpt = {
+        "vits16": "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+        "vitb16": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+        "vitl16": "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
     }
-    ckpt_name = size2ckpt[size]
-    model_type = ckpt_name.split('_')[0] + '_' + ckpt_name.split('_')[1]
-    model = torch.hub.load('./dinov3', model_type, source='local', weights=f'./dinov3_ckpts/{ckpt_name}')
-    model.to(device)
-    model.eval()
-    return model
+    repo_dir = Path(dino_cfg.get("repo_dir", "./dinov3")).expanduser()
+    weights_dir = Path(dino_cfg.get("weights_dir", "./dinov3_ckpts")).expanduser()
+    ckpt_path = weights_dir / variant_to_ckpt[spec.variant]
+    if not repo_dir.exists():
+        raise FileNotFoundError(f"DINOv3 repo directory not found: {repo_dir}")
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"DINOv3 checkpoint not found: {ckpt_path}")
+    return torch.hub.load(
+        str(repo_dir),
+        f"dinov3_{spec.variant}",
+        source="local",
+        weights=str(ckpt_path),
+    )
+
+
+def _load_torch_hub_model(spec: DinoBackboneSpec, dino_cfg: Dict[str, Any]) -> nn.Module:
+    pretrained = bool(dino_cfg.get("pretrained", True))
+
+    if spec.family == "dino":
+        repo_or_dir = str(dino_cfg.get("repo_dir", "facebookresearch/dino:main"))
+        hub_name = f"dino_{spec.variant}"
+        if os.path.exists(os.path.expanduser(repo_or_dir)):
+            return torch.hub.load(os.path.expanduser(repo_or_dir), hub_name, source="local", pretrained=pretrained)
+        return torch.hub.load(repo_or_dir, hub_name, pretrained=pretrained)
+
+    if spec.family == "dinov2":
+        repo_or_dir = str(dino_cfg.get("repo_dir", "facebookresearch/dinov2"))
+        hub_name = f"dinov2_{spec.variant}"
+        load_kwargs: Dict[str, Any] = {"pretrained": pretrained}
+        if dino_cfg.get("weights", None) is not None:
+            load_kwargs["weights"] = dino_cfg["weights"]
+        if os.path.exists(os.path.expanduser(repo_or_dir)):
+            return torch.hub.load(os.path.expanduser(repo_or_dir), hub_name, source="local", **load_kwargs)
+        return torch.hub.load(repo_or_dir, hub_name, **load_kwargs)
+
+    raise ValueError(f"Unsupported torch.hub DINO family '{spec.family}'.")
+
+
+def load_dino_model(
+    size: str = "s",
+    device: str = "cuda",
+    dino_cfg: Optional[Dict[str, Any]] = None,
+) -> torch.nn.Module:
+    """
+    Load a pretrained DINO-family backbone and normalize its feature interface.
+
+    Backward compatibility:
+    - If only `size` is provided, the legacy DINOv3 path is used.
+    - New configs should prefer `dino_cfg={"version": ..., "variant": ...}`.
+    """
+    effective_cfg = dict(dino_cfg or {})
+    if "size" not in effective_cfg and "variant" not in effective_cfg and "version" not in effective_cfg:
+        effective_cfg["size"] = size
+
+    spec = resolve_dino_backbone_spec(effective_cfg)
+    if spec.family == "dinov3":
+        model = _load_dinov3_local_model(spec, effective_cfg)
+    else:
+        model = _load_torch_hub_model(spec, effective_cfg)
+
+    adapted = DinoBackboneAdapter(model, spec)
+    adapted.to(device)
+    adapted.eval()
+    return adapted
 
 
 @torch.no_grad()
@@ -58,7 +352,7 @@ def dino_patch_extraction(
         return_cls_token: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
-    Extracts patch embeddings from images using a pretrained DINO model.
+    Extract patch embeddings from images using a pretrained DINO-family backbone.
 
     Args:
         images (torch.Tensor): Input images of shape (B, C, H, W).
@@ -67,18 +361,30 @@ def dino_patch_extraction(
 
     Returns:
         If return_cls_token is False:
-            torch.Tensor: Patch embeddings of shape (B, D, H // 16, W // 16)
+            torch.Tensor: Patch embeddings of shape (B, D, Hf, Wf)
         If return_cls_token is True:
             Tuple[torch.Tensor, torch.Tensor]: (patch_embeddings, cls_token)
-                - patch_embeddings: (B, D, H // 16, W // 16)
+                - patch_embeddings: (B, D, Hf, Wf)
                 - cls_token: (B, D)
     """
     out = model.forward_features(images)
     features = out['x_norm_patchtokens']
-    patch_embeddings = features.permute(0, 2, 1).reshape(features.size(0), -1, int(images.size(2) / 16), int(images.size(3) / 16))
+    spatial_shape = out.get("spatial_shape", None)
+    if spatial_shape is None:
+        num_tokens = int(features.shape[1])
+        side = int(math.isqrt(num_tokens))
+        if side * side != num_tokens:
+            raise ValueError(
+                "Backbone did not provide spatial_shape and patch token count is not square. "
+                "Please return spatial_shape from forward_features."
+            )
+        spatial_shape = (side, side)
+    patch_embeddings = features.permute(0, 2, 1).reshape(features.size(0), -1, *spatial_shape)
 
     if return_cls_token:
-        cls_token = out['x_norm_clstoken']
+        cls_token = out.get('x_norm_clstoken', None)
+        if cls_token is None:
+            raise ValueError(f"{getattr(model, 'family', 'backbone')} does not expose a CLS token.")
         return patch_embeddings, cls_token
     return patch_embeddings
 
@@ -356,24 +662,73 @@ def merge_instance_masks_by_category(
     return semantic_masks, semantic_categories
 
 
-def build_slot_mar_components(cfg: Dict[str, Any], device: torch.device):
+def resolve_slot_model_type(cfg: Dict[str, Any]) -> str:
+    model_cfg = cfg.get("model", {})
+    model_type = model_cfg.get("type", cfg.get("model_type", None))
+    if model_type is None:
+        if "ar" in cfg and "mar" not in cfg:
+            model_type = "ar"
+        else:
+            model_type = "mar"
+
+    normalized = str(model_type).strip().lower().replace("-", "_")
+    alias_map = {
+        "mar": "mar",
+        "masked": "mar",
+        "masked_autoencoder": "mar",
+        "masked_autoregressive": "mar",
+        "ar": "ar",
+        "autoregressive": "ar",
+        "auto_regressive": "ar",
+    }
+    if normalized not in alias_map:
+        raise ValueError(f"Unsupported model.type '{model_type}'. Use 'mar' or 'ar'.")
+    return alias_map[normalized]
+
+
+def build_slot_model_components(cfg: Dict[str, Any], device: torch.device):
     """
-    Construct the DINO backbone, slot attention, and MAR-style decoder for training.
+    Construct the DINO backbone, slot attention, and configured slot decoder.
     """
+    from src.models.ar import SlotARDecoder
     from src.models.slot_mar import SlotMARDecoder
     from src.models.slot_attn import MultiHeadSTEVESA
 
-    dino = load_dino_model(size=cfg["dino"]["size"], device=str(device))
+    dino_cfg = cfg.get("dino", {})
+    dino = load_dino_model(
+        size=str(dino_cfg.get("size", "b")),
+        device=str(device),
+        dino_cfg=dino_cfg,
+    )
     dino.eval()
 
     sa_cfg = cfg["slots"]
+    model_type = resolve_slot_model_type(cfg)
+    decoder_cfg_key = "ar" if model_type == "ar" else "mar"
+    decoder_cfg = cfg.get(decoder_cfg_key, {})
     input_size = sa_cfg.get("input_size", None)
     out_size = sa_cfg.get("out_size", None)
     num_heads = sa_cfg["num_heads"]
-    if input_size is None or out_size is None:
-        dummy = torch.zeros(1, 3, cfg["data"]["image_size"], cfg["data"]["image_size"], device=device)
+    image_size = int(cfg["data"]["image_size"])
+    image_multiple = int(getattr(dino, "image_multiple", 1))
+    if image_multiple > 1 and image_size % image_multiple != 0:
+        lower = (image_size // image_multiple) * image_multiple
+        upper = math.ceil(image_size / image_multiple) * image_multiple
+        candidates = [str(v) for v in sorted({v for v in (lower, upper) if v > 0})]
+        raise ValueError(
+            f"data.image_size={image_size} is incompatible with "
+            f"{getattr(dino, 'family', 'dino')}/{getattr(dino, 'variant', 'backbone')}: "
+            f"it must be a multiple of {image_multiple}. Suggested values: {', '.join(candidates)}."
+        )
+    pos_embed_type = str(decoder_cfg.get("pos_embed_type", "learned")).lower()
+    need_dummy_features = input_size is None or out_size is None or pos_embed_type == "learned"
+    feats = None
+    if need_dummy_features:
+        dummy = torch.zeros(1, 3, image_size, image_size, device=device)
         with torch.no_grad():
             feats = extract_features(dummy, dino)
+    if input_size is None or out_size is None:
+        assert feats is not None
         feat_dim = feats.shape[1]
         input_size = feat_dim if input_size is None else input_size
         out_size = feat_dim if out_size is None else out_size
@@ -396,48 +751,78 @@ def build_slot_mar_components(cfg: Dict[str, Any], device: torch.device):
         qk_rmsnorm_eps=sa_cfg.get("qk_rmsnorm_eps", 1e-6),
         init_mode=sa_cfg.get("init_mode", "gaussian"),
         kmeans_iters=sa_cfg.get("kmeans_iters", 10),
+        token_crf_cfg=cfg.get("crf", {}),
     ).to(device)
 
-    mar_cfg = cfg.get("mar", {})
     mask_cfg = cfg.get("masking", {})
     ratio_min = mask_cfg.get("ratio_min", mask_cfg.get("ratio", 0.7))
     ratio_max = mask_cfg.get("ratio_max", mask_cfg.get("ratio", ratio_min))
+    num_tokens = int(feats.shape[-2] * feats.shape[-1]) if feats is not None else None
+    max_seq_len = int(decoder_cfg.get("max_seq_len", 256))
+    if pos_embed_type == "learned" and num_tokens is not None and num_tokens > max_seq_len:
+        raise ValueError(
+            f"{decoder_cfg_key}.max_seq_len={max_seq_len} is too small for "
+            f"{getattr(dino, 'family', 'dino')}/{getattr(dino, 'variant', 'backbone')} "
+            f"at image_size={image_size}: this configuration produces {num_tokens} tokens."
+        )
 
-    decoder = SlotMARDecoder(
-        slot_size=sa_cfg["slot_size"],
-        feat_dim=feat_dim,
-        model_dim=mar_cfg.get("model_dim", sa_cfg["slot_size"]),
-        encoder_depth=int(mar_cfg.get("encoder_depth", 4)),
-        decoder_depth=int(mar_cfg.get("decoder_depth", 4)),
-        num_heads=int(mar_cfg.get("num_heads", num_heads)),
-        mlp_hidden_dim=mar_cfg.get("mlp_hidden_dim", None),
-        dropout=float(mar_cfg.get("dropout", 0.0)),
-        self_attn_type=str(mar_cfg.get("self_attn_type", "full")),
-        prediction_order=str(mar_cfg.get("prediction_order", "random")),
-        predict_tokens=mar_cfg.get("predict_tokens", None),
-        buffer_size=int(mar_cfg.get("buffer_size", 64)),
-        register_slots=int(mar_cfg.get("register_slots", 0)),
-        slot_conditioned=bool(mar_cfg.get("slot_conditioned", False)),
-        slot_conditional_depth=int(mar_cfg.get("slot_conditional_depth", 1)),
-        slot_conditional_dropout=float(mar_cfg.get("slot_conditional_dropout", 0.0)),
-        slot_conditional_qk_norm=bool(mar_cfg.get("slot_conditional_qk_norm", True)),
-        slot_conditional_embed=bool(mar_cfg.get("slot_conditional_embed", False)),
-        add_pos_to_known=bool(mar_cfg.get("add_pos_to_known", True)),
-        mask_ratio_min=float(ratio_min),
-        mask_ratio_max=float(ratio_max),
-        mask_ratio_mode=str(mask_cfg.get("ratio_mode", mar_cfg.get("mask_ratio_mode", "truncated_gaussian"))),
-        mask_ratio_std=float(mask_cfg.get("ratio_std", mar_cfg.get("mask_ratio_std", 0.25))),
-        masking_strategy=str(mask_cfg.get("strategy", mar_cfg.get("masking_strategy", "order"))),
-        use_qk_norm=bool(mar_cfg.get("qk_norm", True)),
-        use_bos_token=bool(mar_cfg.get("use_bos_token", False)),
-        pos_embed_type=str(mar_cfg.get("pos_embed_type", "learned")),
-        max_seq_len=int(mar_cfg.get("max_seq_len", 256)),
-        use_torch_sampling=bool(mar_cfg.get("use_torch_sampling", True)),
-        slot_cross_mlp=bool(mar_cfg.get("slot_cross_mlp", False)),
-        slot_cross_mlp_skip=bool(mar_cfg.get("slot_cross_mlp_skip", True)),
-    ).to(device)
+    shared_decoder_kwargs = {
+        "slot_size": sa_cfg["slot_size"],
+        "feat_dim": feat_dim,
+        "model_dim": decoder_cfg.get("model_dim", sa_cfg["slot_size"]),
+        "encoder_depth": int(decoder_cfg.get("encoder_depth", 4)),
+        "decoder_depth": int(decoder_cfg.get("decoder_depth", 4)),
+        "num_heads": int(decoder_cfg.get("num_heads", num_heads)),
+        "mlp_hidden_dim": decoder_cfg.get("mlp_hidden_dim", None),
+        "dropout": float(decoder_cfg.get("dropout", 0.0)),
+        "self_attn_type": str(decoder_cfg.get("self_attn_type", "causal" if model_type == "ar" else "full")),
+        "prediction_order": str(decoder_cfg.get("prediction_order", "raster" if model_type == "ar" else "random")),
+        "buffer_size": int(decoder_cfg.get("buffer_size", 64)),
+        "register_slots": int(decoder_cfg.get("register_slots", 0)),
+        "slot_conditioned": bool(decoder_cfg.get("slot_conditioned", False)),
+        "slot_conditional_depth": int(decoder_cfg.get("slot_conditional_depth", 1)),
+        "slot_conditional_dropout": float(decoder_cfg.get("slot_conditional_dropout", 0.0)),
+        "slot_conditional_qk_norm": bool(decoder_cfg.get("slot_conditional_qk_norm", True)),
+        "slot_conditional_embed": bool(decoder_cfg.get("slot_conditional_embed", False)),
+        "use_qk_norm": bool(decoder_cfg.get("qk_norm", True)),
+        "use_bos_token": bool(decoder_cfg.get("use_bos_token", model_type == "ar")),
+        "pos_embed_type": pos_embed_type,
+        "max_seq_len": max_seq_len,
+        "slot_cross_mlp": bool(decoder_cfg.get("slot_cross_mlp", False)),
+        "slot_cross_mlp_skip": bool(decoder_cfg.get("slot_cross_mlp_skip", True)),
+    }
+
+    if model_type == "ar":
+        decoder = SlotARDecoder(
+            **shared_decoder_kwargs,
+            eps=float(decoder_cfg.get("eps", 1e-6)),
+            random_order_prob_start=float(decoder_cfg.get("random_order_prob_start", 1.0)),
+            random_order_prob_start_step=int(decoder_cfg.get("random_order_prob_start_step", 0)),
+            random_order_prob_end=float(decoder_cfg.get("random_order_prob_end", 1.0)),
+            random_order_prob_end_step=int(decoder_cfg.get("random_order_prob_end_step", 0)),
+        ).to(device)
+    else:
+        decoder = SlotMARDecoder(
+            **shared_decoder_kwargs,
+            predict_tokens=decoder_cfg.get("predict_tokens", None),
+            add_pos_to_known=bool(decoder_cfg.get("add_pos_to_known", True)),
+            mask_ratio_min=float(ratio_min),
+            mask_ratio_max=float(ratio_max),
+            mask_ratio_mode=str(mask_cfg.get("ratio_mode", decoder_cfg.get("mask_ratio_mode", "truncated_gaussian"))),
+            mask_ratio_std=float(mask_cfg.get("ratio_std", decoder_cfg.get("mask_ratio_std", 0.25))),
+            masking_strategy=str(mask_cfg.get("strategy", decoder_cfg.get("masking_strategy", "order"))),
+            eps=float(decoder_cfg.get("eps", 1e-6)),
+            use_torch_sampling=bool(decoder_cfg.get("use_torch_sampling", True)),
+        ).to(device)
 
     return dino, slot_attn, decoder, feat_dim
+
+
+def build_slot_mar_components(cfg: Dict[str, Any], device: torch.device):
+    """
+    Backward-compatible wrapper around the generic slot-model builder.
+    """
+    return build_slot_model_components(cfg, device)
 
 
 def build_lr_scheduler(
