@@ -1,6 +1,5 @@
 model:
   type: ar
-
 train:
   max_updates: 100002
   val_every_updates: 10000
@@ -30,12 +29,12 @@ train:
   max_samples_val: 2000
   max_val_batches: 20
   grad_clip_norm: 1.0
-  learning_rate: 3.0e-4
-  weight_decay: 1.0e-4
+  learning_rate: 0.0003
+  weight_decay: 0.0001
   lr_schedule:
     type: cosine
     warmup_steps: 10000
-    min_lr: 1.0e-6
+    min_lr: 1.0e-06
   ema:
     enabled: false
     rate: 0.9999
@@ -46,14 +45,13 @@ train:
     resume_path: null
     resume_latest: false
   amp: true
-  amp_dtype: "bfloat16"
+  amp_dtype: bfloat16
   dino_cache:
     enabled: false
     dir: ./data/coco/dino_cache
     skip_image_loading: true
     backend: lmdb
     lmdb_map_size_gb: 256
-
 data:
   dataset: coco
   root: ./data/coco
@@ -63,13 +61,11 @@ data:
   val_split: val2017
   min_area: 0.0
   train_horizontal_flip_prob: 0.5
-
 dino:
   version: v3
   variant: vitb16
   freeze: true
   compile: false
-
 slots:
   num_iterations: 5
   num_slots: 7
@@ -80,11 +76,10 @@ slots:
   mlp_hidden_size: 2048
   truncate: fixed-point
   qk_rmsnorm: false
-  qk_rmsnorm_eps: 1.0e-6
+  qk_rmsnorm_eps: 1.0e-06
   rope: {}
   init_mode: gaussian
   kmeans_iters: 10
-
 ar:
   model_dim: 768
   encoder_depth: 0
@@ -94,26 +89,25 @@ ar:
   slot_cross_mlp: false
   dropout: 0.0
   self_attn_type: causal
-  prediction_order: raster  # 'random' or 'raster'
-  random_order_prob_start: 1.0  # Initial probability that a training sample uses a random token order instead of raster order.
-  random_order_prob_start_step: 50000  # First training step where the random-order probability starts changing away from `random_order_prob_start`.
-  random_order_prob_end: 0.0  # Final probability that a training sample uses a random token order after the schedule finishes.
-  random_order_prob_end_step: 100000  # Training step where the random-order schedule reaches `random_order_prob_end`.
+  prediction_order: raster
+  random_order_prob_start: 1.0
+  random_order_prob_start_step: 50000
+  random_order_prob_end: 0.0
+  random_order_prob_end_step: 100000
   buffer_size: 64
   register_slots: 64
-  slot_conditioned: false  # Runs slot-conditioned attention blocks that let slots and ordered token inputs interact before decoding.
-  slot_conditional_depth: 2  # Number of slot-conditioned attention blocks to apply when `slot_conditioned` is enabled.
-  slot_conditional_dropout: 0.0  # Dropout used inside the slot-conditioned attention blocks.
-  slot_conditional_qk_norm: false  # Enables query/key normalization inside the slot-conditioned attention blocks for more stable attention scores.
-  slot_conditional_embed: false  # Adds a learned slot-mixture embedding to each autoregressive token input based on slot-attention assignments.
+  slot_conditioned: false
+  slot_conditional_depth: 2
+  slot_conditional_dropout: 0.0
+  slot_conditional_qk_norm: false
+  slot_conditional_embed: false
   qk_norm: false
   use_bos_token: true
   pos_embed_type: mlp
   max_seq_len: 256
-
 mask_matching:
   enabled: false
-  loss_type: bce  # bce | soft_ce | kl
+  loss_type: bce
   lambda_start: 0.0
   lambda_end: 0.05
   coeff_by_loss:
@@ -122,9 +116,8 @@ mask_matching:
     kl: 10.0
   lambda_warmup_steps: 0
   lambda_ramp_steps: 40000
-
 crf:
-  enabled: false
+  enabled: true
   num_iterations: 5
   detach_features: true
   unary_temperature: 1.0
@@ -132,11 +125,11 @@ crf:
   exclude_self: true
   spatial:
     enabled: true
-    weight: 3.0
+    weight: 1.5
     sigma: 1.5
   appearance:
     enabled: true
-    weight: 6.0
+    weight: 3.0
     sigma: 0.35
     spatial_sigma: 2.5
     similarity: cosine
@@ -144,8 +137,8 @@ crf:
   compatibility:
     type: potts
   slot_attention:
-    mode: disabled  # disabled | replace | blend
-    apply_every_iteration: false
+    mode: replace
+    apply_every_iteration: true
     ste_grad: false
     ste_grad_scale: 1.0
     detach_refined: false
@@ -155,29 +148,36 @@ crf:
   guidance:
     slot_attention:
       enabled: false
-      loss_type: soft_ce  # bce | soft_ce | kl | mse
-      coeff: 0.2
+      loss_type: soft_ce
+      coeff: 1.0
       lambda_start: 0.0
-      lambda_end: 0.05
-      lambda_warmup_steps: 0
-      lambda_ramp_steps: 40000
+      lambda_end: 0.005
+      lambda_warmup_steps: 20000
+      lambda_ramp_steps: 80000
       target_detach: true
+      start_step: 20000
+      target_temperature: 2.0
+      pred_temperature: 1.0
     decoder:
       enabled: false
-      loss_type: soft_ce  # bce | soft_ce | kl | mse
-      coeff: 0.2
+      loss_type: soft_ce
+      coeff: 1.0
       lambda_start: 0.0
-      lambda_end: 0.05
-      lambda_warmup_steps: 0
-      lambda_ramp_steps: 40000
+      lambda_end: 0.005
+      lambda_warmup_steps: 20000
+      lambda_ramp_steps: 80000
       target_detach: true
-
+      start_step: 20000
+      target_temperature: 2.0
+      pred_temperature: 1.0
 wandb:
   enabled: true
   project: slot-ar
   entity: null
-  run_name: ar_coco_B_no_mask_matching_no_slot_mixture_raster
+  run_name: ar_coco_B_no_mask_matching_no_slot_mixture_raster_crf_iter2_all_iters_weights_half
   mode: online
-
 output:
   dir: runs
+experiment:
+  hypothesis: Gentler pairwise terms may keep CRF useful without forcing premature
+    hard slots.

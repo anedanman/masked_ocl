@@ -183,6 +183,9 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         self.token_crf_mode = "off"
         self.token_crf_apply_every_iteration = False
         self.token_crf_ste_grad = False
+        self.token_crf_ste_grad_scale = 1.0
+        self.token_crf_detach_refined = False
+        self.token_crf_detach_refined_except_final = False
         self.token_crf_blend = 0.5
         self.token_crf_return_refined_attn = True
 
@@ -191,6 +194,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             spatial_cfg = dict(token_crf_cfg.get("spatial", {}) or {})
             appearance_cfg = dict(token_crf_cfg.get("appearance", {}) or {})
             slot_crf_cfg = dict(token_crf_cfg.get("slot_attention", {}) or {})
+            compatibility_cfg = dict(token_crf_cfg.get("compatibility", {}) or {})
 
             spatial_enabled = bool(spatial_cfg.get("enabled", True))
             appearance_enabled = bool(appearance_cfg.get("enabled", True))
@@ -214,6 +218,17 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                 normalize_features=bool(appearance_cfg.get("normalize_features", True)),
                 detach_features=bool(token_crf_cfg.get("detach_features", True)),
                 unary_temperature=float(token_crf_cfg.get("unary_temperature", 1.0)),
+                slot_size=slot_size,
+                compatibility_type=str(compatibility_cfg.get("type", "potts")),
+                compatibility_hidden_dim=compatibility_cfg.get("hidden_dim", None),
+                compatibility_projection_dim=int(compatibility_cfg.get("projection_dim", 128)),
+                compatibility_transform=str(
+                    compatibility_cfg.get("transform", "one_minus_cosine")
+                ),
+                compatibility_temperature=float(compatibility_cfg.get("temperature", 1.0)),
+                compatibility_detach_slots=bool(compatibility_cfg.get("detach_slots", False)),
+                compatibility_symmetrize=bool(compatibility_cfg.get("symmetrize", True)),
+                compatibility_diagonal=str(compatibility_cfg.get("diagonal", "zero")),
                 eps=float(token_crf_cfg.get("eps", epsilon)),
             )
 
@@ -232,6 +247,11 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                 slot_crf_cfg.get("apply_every_iteration", False)
             )
             self.token_crf_ste_grad = bool(slot_crf_cfg.get("ste_grad", False))
+            self.token_crf_ste_grad_scale = float(slot_crf_cfg.get("ste_grad_scale", 1.0))
+            self.token_crf_detach_refined = bool(slot_crf_cfg.get("detach_refined", False))
+            self.token_crf_detach_refined_except_final = bool(
+                slot_crf_cfg.get("detach_refined_except_final", False)
+            )
             self.token_crf_blend = float(slot_crf_cfg.get("blend", 0.5))
             self.token_crf_return_refined_attn = bool(
                 slot_crf_cfg.get("return_refined_attn", True)
@@ -260,17 +280,24 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         self,
         raw_attn_vis: torch.Tensor,
         refined_attn_vis: torch.Tensor,
+        *,
+        is_last_iter: bool,
     ) -> torch.Tensor:
+        detach_refined = self.token_crf_detach_refined or (
+            self.token_crf_detach_refined_except_final and not is_last_iter
+        )
+        refined_for_forward = refined_attn_vis.detach() if detach_refined else refined_attn_vis
         if self.token_crf_mode == "replace":
-            effective = refined_attn_vis
+            effective = refined_for_forward
         elif self.token_crf_mode == "blend":
             blend = min(max(self.token_crf_blend, 0.0), 1.0)
-            effective = (1.0 - blend) * raw_attn_vis + blend * refined_attn_vis
+            effective = (1.0 - blend) * raw_attn_vis + blend * refined_for_forward
         else:
             effective = raw_attn_vis
 
         if self.token_crf_mode != "off" and self.token_crf_ste_grad:
-            effective = effective.detach() + (raw_attn_vis - raw_attn_vis.detach())
+            scale = max(float(self.token_crf_ste_grad_scale), 0.0)
+            effective = effective.detach() + scale * (raw_attn_vis - raw_attn_vis.detach())
         return effective
         
     def forward(self, inputs, *, cls_token: Optional[torch.Tensor] = None, return_info: bool = False):
@@ -418,6 +445,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                     token_crf_context=token_crf_context,
                     compute_crf=compute_crf,
                     apply_crf=apply_crf,
+                    is_last_iter=is_last_iter,
                 )
                 if iter_info:
                     last_iter_info = iter_info
@@ -455,6 +483,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         token_crf_context: Optional[TokenCRFContext] = None,
         compute_crf: bool = False,
         apply_crf: bool = False,
+        is_last_iter: bool = True,
     ):
         slots_prev = slots
         slots = self.norm_slots(slots)
@@ -486,12 +515,17 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                 raw_assignments,
                 token_crf_context,
                 token_mask=token_mask,
+                slot_embeddings=slots,
             )
             refined_assignments = refinement.refined_probs
             refined_attn_vis = self._assignments_to_attn_vis(raw_attn_vis, refined_assignments)
             crf_stats = refinement.stats
             if apply_crf:
-                effective_attn_vis = self._apply_token_crf_mode(raw_attn_vis, refined_attn_vis)
+                effective_attn_vis = self._apply_token_crf_mode(
+                    raw_attn_vis,
+                    refined_attn_vis,
+                    is_last_iter=is_last_iter,
+                )
 
         # Weighted mean.
         attn = effective_attn_vis + self.epsilon

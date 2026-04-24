@@ -105,7 +105,57 @@ This combines semantic similarity in feature space with a spatial locality prior
 
 Both kernels are row-normalized. Optionally, the graph can be sparsified by keeping only the top-$k$ neighbors per token.
 
-### 3.4 Mean-Field Refinement
+### 3.4 Label Compatibility
+
+By default, the CRF uses Potts compatibility:
+
+$$
+\mu(k,l)=\mathbb{1}[k \ne l],
+$$
+
+so neighboring tokens are penalized when they place mass on different slots. This is the classical dense-CRF choice and remains the default through:
+
+```yaml
+crf:
+  compatibility:
+    type: potts
+```
+
+The second experiment iteration adds an optional learned slot-conditioned compatibility. In this mode, each current slot vector is projected with a small MLP, normalized, and compared by cosine similarity:
+
+$$
+\mathbf{z}_k =
+\operatorname{norm}(\operatorname{MLP}(\mathbf{s}_k)),
+\qquad
+c_{kl} = \mathbf{z}_k^\top \mathbf{z}_l.
+$$
+
+The default transform converts similarity into a non-negative disagreement cost:
+
+$$
+\mu(k,l)=\frac{1-c_{kl}}{2\tau},
+\qquad
+\mu(k,k)=0.
+$$
+
+Intuitively, two slots whose embeddings look similar are treated as less mutually incompatible, while dissimilar slots receive stronger pairwise repulsion. This is configured entirely inside the CRF block:
+
+```yaml
+crf:
+  compatibility:
+    type: cosine_mlp
+    hidden_dim: 512
+    projection_dim: 128
+    transform: one_minus_cosine
+    temperature: 1.0
+    detach_slots: false
+    symmetrize: true
+    diagonal: zero
+```
+
+Supported transforms are `one_minus_cosine`, `cosine`, `negative_cosine`, and `softplus_negative_cosine`. The learned compatibility path also logs compatibility summary statistics, including off-diagonal mean and standard deviation, so runs can reveal whether the layer learns a meaningful non-Potts structure.
+
+### 3.5 Mean-Field Refinement
 
 Starting from $Q^{(0)} = A$, the CRF performs iterative mean-field updates:
 
@@ -115,7 +165,21 @@ Q^{(m+1)} = \operatorname{softmax}\left(
 \right),
 $$
 
-where $\Psi(\cdot)$ is the sum of pairwise messages from the enabled kernels under a Potts compatibility transform. Intuitively, the CRF increases confidence when semantically similar nearby tokens already agree, and suppresses isolated inconsistent assignments.
+where $\Psi(\cdot)$ is the sum of pairwise messages from the enabled kernels under the configured label compatibility. Intuitively, the CRF increases confidence when semantically similar nearby tokens already agree, and suppresses isolated inconsistent assignments.
+
+With learned compatibility, the Potts message
+
+$$
+\sum_l \mathbb{1}[k \ne l] m_l
+$$
+
+is replaced with
+
+$$
+\sum_l \mu(k,l)m_l,
+$$
+
+where $\mu$ is computed from the current slots.
 
 The output is a refined assignment distribution
 
@@ -152,6 +216,28 @@ The CRF can be applied only at the last Slot Attention iteration or at every ite
 ### 4.5 Straight-through gradient option
 
 When enabled, the model can use CRF-refined forward values while preserving the gradient pathway of the original slot-attention logits through a straight-through estimator. This lets the CRF influence the forward slot update without making optimization depend entirely on a detached external refinement.
+
+The second experiment iteration adds a `ste_grad_scale` knob:
+
+```yaml
+crf:
+  slot_attention:
+    ste_grad: true
+    ste_grad_scale: 0.25
+```
+
+This keeps the CRF-refined forward value, but scales the raw-attention backward substitute. The motivation is empirical: the first CRF sweep showed that full-strength STE variants performed much worse than ordinary differentiable CRF replacement. One likely cause is a mismatch between the forward fixed point used for slot updates and the raw Slot Attention gradient used for learning.
+
+The same section now also exposes two stop-gradient controls:
+
+```yaml
+crf:
+  slot_attention:
+    detach_refined: false
+    detach_refined_except_final: false
+```
+
+`detach_refined: true` treats the CRF as a forward-only optimizer: refined assignments are used to aggregate tokens into slots, but gradients do not pass through the CRF refinement itself. `detach_refined_except_final: true` is more selective: when CRF is applied at every Slot Attention iteration, intermediate CRF refinements are detached while the final refinement remains differentiable. This mirrors the spirit of the Slot Attention fixed-point truncation trick and tests whether repeated differentiable CRF updates destabilize learning.
 
 ## 5. Slot-Conditioned Feature Decoder
 
@@ -194,6 +280,24 @@ where $\mathcal{D}$ can be KL divergence, soft cross-entropy, BCE, or MSE, depen
 
 This encourages the slot extractor itself to internalize the CRF’s structured prior instead of relying on the CRF only at inference time.
 
+The guidance target can now be temperature-softened before matching:
+
+```yaml
+crf:
+  guidance:
+    slot_attention:
+      enabled: true
+      loss_type: soft_ce
+      lambda_end: 0.005
+      lambda_warmup_steps: 20000
+      lambda_ramp_steps: 80000
+      start_step: 20000
+      target_temperature: 2.0
+      pred_temperature: 1.0
+```
+
+This is meant to avoid forcing the slot extractor to chase an overconfident moving pseudo-label too early in training. `start_step` skips the guidance loss entirely before the configured step; the lambda warmup then controls how quickly the active loss reaches its final weight.
+
 ### 6.3 Optional decoder guidance loss
 
 The decoder’s cross-attention masks are also compared to the CRF target:
@@ -206,6 +310,8 @@ $$
 where $M_{\text{dec}}$ denotes decoder masks and $\widetilde{A}_{\text{img}}$ is the CRF-refined assignment reshaped into per-slot spatial masks.
 
 This supervision does not directly bias cross-attention logits in the current implementation. Instead, it trains the decoder to align its own emergent slot-token correspondence with the CRF-refined object partition.
+
+Decoder guidance supports the same target and prediction temperatures as slot-attention guidance. The second sweep tests much weaker decoder guidance because the first sweep showed that direct decoder supervision against hard CRF targets can dominate reconstruction and harm object-centric metrics.
 
 ### 6.4 Existing slot/decoder mask matching loss
 
@@ -240,6 +346,7 @@ The CRF integration is controlled by the `crf` section in the YAML config. The m
 - `crf.num_iterations`: mean-field iterations.
 - `crf.spatial.*`: spatial kernel strength and bandwidth.
 - `crf.appearance.*`: DINO-feature kernel strength, bandwidth, and spatial extent.
+- `crf.compatibility.*`: Potts or learned slot-conditioned label compatibility.
 - `crf.pairwise_topk`: optional sparse neighborhood size.
 - `crf.slot_attention.*`: how CRF refinement modifies slot updates.
 - `crf.guidance.slot_attention.*`: auxiliary loss on Slot Attention assignments.
@@ -274,6 +381,23 @@ The default sweep includes:
 - kernel sharpness ablations,
 - sparse top-$k$ CRF variants,
 - longer mean-field schedules.
+
+The repository also includes a second-round generator:
+
+- `scripts/run_crf_experiments_iter2.py`
+
+This script writes configs to `configs/future_runs_iter2` and maintains a separate summary under `runs/slot-ar/_crf_iter2_summary`. It keeps controls from the first sweep and adds experiments motivated by the first leaderboard:
+
+- sparse all-iteration replacement with top-32 and top-64 neighborhoods,
+- gentler CRF weights and fewer mean-field iterations,
+- lower unary temperature to trust Slot Attention more strongly,
+- high-blend all-iteration CRF,
+- reduced-scale STE variants,
+- stop-gradient and final-gradient-only CRF variants,
+- weak, delayed, temperature-softened guidance losses,
+- learned slot-conditioned compatibility variants under `crf.compatibility`, including different projection sizes, compatibility temperatures, sparse graphs, and gradient-control settings.
+
+The iter2 leaderboard includes CRF diagnostics such as assignment delta, entropy, confidence, and compatibility statistics. These are intended to make it easier to distinguish "metric improved because the CRF sharpened good slots" from "metric collapsed because the CRF drove assignments to degenerate confident partitions."
 
 ## 10. Summary
 

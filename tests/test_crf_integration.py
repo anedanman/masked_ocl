@@ -29,6 +29,34 @@ def test_token_feature_crf_preserves_distribution_shape_and_normalization() -> N
     assert "delta_l1" in refined.stats
 
 
+def test_token_feature_crf_supports_learned_slot_compatibility() -> None:
+    crf = TokenFeatureCRF(
+        num_iterations=2,
+        spatial_weight=1.0,
+        spatial_sigma=1.0,
+        appearance_weight=1.0,
+        appearance_sigma=0.5,
+        appearance_spatial_sigma=2.0,
+        slot_size=8,
+        compatibility_type="cosine_mlp",
+        compatibility_projection_dim=4,
+    )
+    features = torch.randn(2, 8, 4, 4)
+    slots = torch.randn(2, 3, 8)
+    probs = torch.softmax(torch.randn(2, 16, 3), dim=-1)
+    context = crf.build_context(features)
+    refined = crf.refine(probs, context, slot_embeddings=slots)
+
+    assert refined.refined_probs.shape == probs.shape
+    assert torch.allclose(
+        refined.refined_probs.sum(dim=-1),
+        torch.ones_like(refined.refined_probs[..., 0]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert "compatibility_offdiag_mean" in refined.stats
+
+
 def test_slot_attention_returns_crf_info_when_enabled() -> None:
     slot_attn = MultiHeadSTEVESA(
         num_iterations=3,

@@ -38,6 +38,15 @@ class TokenFeatureCRF(nn.Module):
         normalize_features: bool = True,
         detach_features: bool = True,
         unary_temperature: float = 1.0,
+        slot_size: Optional[int] = None,
+        compatibility_type: str = "potts",
+        compatibility_hidden_dim: Optional[int] = None,
+        compatibility_projection_dim: int = 128,
+        compatibility_transform: str = "one_minus_cosine",
+        compatibility_temperature: float = 1.0,
+        compatibility_detach_slots: bool = False,
+        compatibility_symmetrize: bool = True,
+        compatibility_diagonal: str = "zero",
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -59,6 +68,47 @@ class TokenFeatureCRF(nn.Module):
         self.normalize_features = bool(normalize_features)
         self.detach_features = bool(detach_features)
         self.unary_temperature = float(unary_temperature)
+        compatibility_type = str(compatibility_type).lower()
+        compatibility_type = {
+            "disabled": "potts",
+            "none": "potts",
+            "learned_cosine": "cosine_mlp",
+            "slot_cosine": "cosine_mlp",
+        }.get(compatibility_type, compatibility_type)
+        if compatibility_type not in ("potts", "cosine_mlp"):
+            raise ValueError("compatibility_type must be 'potts' or 'cosine_mlp'.")
+        self.compatibility_type = compatibility_type
+        self.compatibility_transform = str(compatibility_transform).lower()
+        if self.compatibility_transform not in (
+            "one_minus_cosine",
+            "cosine",
+            "negative_cosine",
+            "softplus_negative_cosine",
+        ):
+            raise ValueError(
+                "compatibility_transform must be one of: "
+                "one_minus_cosine, cosine, negative_cosine, softplus_negative_cosine."
+            )
+        self.compatibility_temperature = float(compatibility_temperature)
+        self.compatibility_detach_slots = bool(compatibility_detach_slots)
+        self.compatibility_symmetrize = bool(compatibility_symmetrize)
+        self.compatibility_diagonal = str(compatibility_diagonal).lower()
+        if self.compatibility_diagonal not in ("zero", "keep"):
+            raise ValueError("compatibility_diagonal must be 'zero' or 'keep'.")
+        self.slot_compat_mlp: Optional[nn.Module] = None
+        if self.compatibility_type == "cosine_mlp":
+            if slot_size is None:
+                raise ValueError("slot_size is required for cosine_mlp CRF compatibility.")
+            hidden_dim = int(compatibility_hidden_dim or slot_size)
+            projection_dim = int(compatibility_projection_dim)
+            if hidden_dim <= 0 or projection_dim <= 0:
+                raise ValueError("compatibility hidden/projection dimensions must be positive.")
+            self.slot_compat_mlp = nn.Sequential(
+                nn.LayerNorm(int(slot_size)),
+                nn.Linear(int(slot_size), hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, projection_dim),
+            )
         self.eps = float(eps)
         self._coord_cache: dict[tuple[int, int, str], torch.Tensor] = {}
 
@@ -219,12 +269,61 @@ class TokenFeatureCRF(nn.Module):
             ),
         )
 
+    def _build_compatibility_matrix(
+        self,
+        slot_embeddings: Optional[torch.Tensor],
+        *,
+        num_slots: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.compatibility_type == "potts":
+            return None
+        if self.slot_compat_mlp is None or slot_embeddings is None:
+            raise ValueError("slot_embeddings are required for cosine_mlp CRF compatibility.")
+        if slot_embeddings.ndim != 3 or slot_embeddings.shape[1] != num_slots:
+            raise ValueError(
+                f"slot_embeddings must have shape [B, {num_slots}, D], got {tuple(slot_embeddings.shape)}."
+            )
+
+        slots = slot_embeddings.detach() if self.compatibility_detach_slots else slot_embeddings
+        projected = self.slot_compat_mlp(slots.float())
+        projected = F.normalize(projected, dim=-1, eps=self.eps)
+        cosine = torch.matmul(projected, projected.transpose(1, 2)).clamp(-1.0, 1.0)
+        if self.compatibility_symmetrize:
+            cosine = 0.5 * (cosine + cosine.transpose(1, 2))
+
+        if self.compatibility_transform == "one_minus_cosine":
+            compat = 0.5 * (1.0 - cosine)
+        elif self.compatibility_transform == "cosine":
+            compat = cosine
+        elif self.compatibility_transform == "negative_cosine":
+            compat = -cosine
+        else:
+            compat = F.softplus(-cosine)
+
+        compat = compat / max(self.compatibility_temperature, self.eps)
+        if self.compatibility_diagonal == "zero":
+            eye = torch.eye(num_slots, device=compat.device, dtype=torch.bool)
+            compat = compat.masked_fill(eye.unsqueeze(0), 0.0)
+        return compat.to(device=device, dtype=dtype)
+
+    def _compatibility_message(
+        self,
+        msg: torch.Tensor,
+        compatibility: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if compatibility is None:
+            return msg.sum(dim=-1, keepdim=True) - msg
+        return torch.einsum("bnl,bkl->bnk", msg, compatibility)
+
     def refine(
         self,
         probs: torch.Tensor,
         context: TokenCRFContext,
         *,
         token_mask: Optional[torch.Tensor] = None,
+        slot_embeddings: Optional[torch.Tensor] = None,
     ) -> TokenCRFRefinement:
         if probs.ndim != 3:
             raise ValueError(f"probs must have shape [B, N, S], got {tuple(probs.shape)}")
@@ -243,16 +342,29 @@ class TokenFeatureCRF(nn.Module):
         else:
             token_mask_f = None
 
+        compatibility = self._build_compatibility_matrix(
+            slot_embeddings,
+            num_slots=q.shape[-1],
+            device=q.device,
+            dtype=q.dtype,
+        )
+
         for _ in range(self.num_iterations):
             pairwise = torch.zeros_like(q)
 
             if context.spatial_kernel is not None:
                 msg = torch.bmm(context.spatial_kernel, q)
-                pairwise = pairwise + self.spatial_weight * (msg.sum(dim=-1, keepdim=True) - msg)
+                pairwise = pairwise + self.spatial_weight * self._compatibility_message(
+                    msg,
+                    compatibility,
+                )
 
             if context.appearance_kernel is not None:
                 msg = torch.bmm(context.appearance_kernel, q)
-                pairwise = pairwise + self.appearance_weight * (msg.sum(dim=-1, keepdim=True) - msg)
+                pairwise = pairwise + self.appearance_weight * self._compatibility_message(
+                    msg,
+                    compatibility,
+                )
 
             q = F.softmax(-(unary + pairwise), dim=-1)
             if token_mask_f is not None:
@@ -264,14 +376,25 @@ class TokenFeatureCRF(nn.Module):
         delta_l1 = (q - q0).abs().sum(dim=-1).mean()
         confidence_before = q0.max(dim=-1).values.mean()
         confidence_after = q.max(dim=-1).values.mean()
+        stats = {
+            "delta_l1": delta_l1,
+            "entropy_before": entropy_before,
+            "entropy_after": entropy_after,
+            "confidence_before": confidence_before,
+            "confidence_after": confidence_after,
+        }
+        if compatibility is not None:
+            eye = torch.eye(compatibility.shape[-1], device=compatibility.device, dtype=torch.bool)
+            offdiag = compatibility.masked_select(~eye.unsqueeze(0))
+            stats["compatibility_mean"] = compatibility.mean()
+            stats["compatibility_offdiag_mean"] = (
+                offdiag.mean() if offdiag.numel() > 0 else compatibility.mean()
+            )
+            stats["compatibility_offdiag_std"] = (
+                offdiag.std(unbiased=False) if offdiag.numel() > 1 else compatibility.new_tensor(0.0)
+            )
 
         return TokenCRFRefinement(
             refined_probs=q.to(dtype=orig_dtype),
-            stats={
-                "delta_l1": delta_l1,
-                "entropy_before": entropy_before,
-                "entropy_after": entropy_after,
-                "confidence_before": confidence_before,
-                "confidence_after": confidence_after,
-            },
+            stats=stats,
         )

@@ -98,6 +98,21 @@ def _linear_ramp_schedule(
     return float(start + (end - start) * progress)
 
 
+def _apply_distribution_temperature(
+    probs: torch.Tensor,
+    temperature: float,
+    *,
+    normalize_dim: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    temperature = float(temperature)
+    if abs(temperature - 1.0) < 1e-8:
+        return probs
+    probs = probs.float().clamp_min(0.0)
+    probs = probs / probs.sum(dim=normalize_dim, keepdim=True).clamp_min(eps)
+    return torch.softmax(probs.clamp_min(eps).log() / max(temperature, eps), dim=normalize_dim)
+
+
 def _resolve_mask_match_coeff(
     mask_match_cfg: Dict[str, object],
     loss_type: str,
@@ -302,6 +317,11 @@ def main():
         sa_guidance_ramp_steps,
     ) = _resolve_scheduled_lambda(sa_guidance_cfg, default_end=0.05)
     sa_guidance_target_detach = bool(sa_guidance_cfg.get("target_detach", True))
+    sa_guidance_target_temperature = float(sa_guidance_cfg.get("target_temperature", 1.0))
+    sa_guidance_pred_temperature = float(sa_guidance_cfg.get("pred_temperature", 1.0))
+    sa_guidance_start_step = int(
+        sa_guidance_cfg.get("start_step", sa_guidance_cfg.get("enabled_after_step", 0))
+    )
 
     dec_guidance_enabled = crf_enabled and bool(dec_guidance_cfg.get("enabled", False))
     dec_guidance_loss_type = normalize_mask_matching_loss_type(
@@ -315,6 +335,11 @@ def main():
         dec_guidance_ramp_steps,
     ) = _resolve_scheduled_lambda(dec_guidance_cfg, default_end=0.05)
     dec_guidance_target_detach = bool(dec_guidance_cfg.get("target_detach", True))
+    dec_guidance_target_temperature = float(dec_guidance_cfg.get("target_temperature", 1.0))
+    dec_guidance_pred_temperature = float(dec_guidance_cfg.get("pred_temperature", 1.0))
+    dec_guidance_start_step = int(
+        dec_guidance_cfg.get("start_step", dec_guidance_cfg.get("enabled_after_step", 0))
+    )
 
     sched_cfg = train_cfg.get("lr_schedule")
     if sched_cfg is None:
@@ -450,7 +475,7 @@ def main():
                 warmup_steps=sa_guidance_warmup_steps,
                 ramp_steps=sa_guidance_ramp_steps,
             )
-            if sa_guidance_enabled
+            if sa_guidance_enabled and global_step >= sa_guidance_start_step
             else 0.0
         )
         sa_guidance_lambda = base_sa_guidance_lambda * sa_guidance_coeff
@@ -462,7 +487,7 @@ def main():
                 warmup_steps=dec_guidance_warmup_steps,
                 ramp_steps=dec_guidance_ramp_steps,
             )
-            if dec_guidance_enabled
+            if dec_guidance_enabled and global_step >= dec_guidance_start_step
             else 0.0
         )
         dec_guidance_lambda = base_dec_guidance_lambda * dec_guidance_coeff
@@ -558,6 +583,7 @@ def main():
 
                 if (
                     sa_guidance_enabled
+                    and global_step >= sa_guidance_start_step
                     and raw_slot_assignments is not None
                     and refined_slot_assignments is not None
                 ):
@@ -567,8 +593,18 @@ def main():
                         else refined_slot_assignments
                     )
                     with torch.autocast(device_type=device.type, enabled=False):
-                        sa_guidance_loss = compute_distribution_matching_loss(
+                        sa_pred = _apply_distribution_temperature(
                             raw_slot_assignments,
+                            sa_guidance_pred_temperature,
+                            normalize_dim=-1,
+                        )
+                        sa_target = _apply_distribution_temperature(
+                            sa_target,
+                            sa_guidance_target_temperature,
+                            normalize_dim=-1,
+                        )
+                        sa_guidance_loss = compute_distribution_matching_loss(
+                            sa_pred,
                             sa_target,
                             loss_type=sa_guidance_loss_type,
                             normalize_dim=-1,
@@ -580,6 +616,7 @@ def main():
 
                 if (
                     dec_guidance_enabled
+                    and global_step >= dec_guidance_start_step
                     and dec_masks is not None
                     and refined_slot_assignments is not None
                 ):
@@ -591,8 +628,18 @@ def main():
                         dec_masks_for_guidance = dec_masks_for_guidance[:, :min_slots]
                     dec_target = crf_masks.detach() if dec_guidance_target_detach else crf_masks
                     with torch.autocast(device_type=device.type, enabled=False):
-                        dec_guidance_loss = compute_mask_matching_loss(
+                        dec_pred = _apply_distribution_temperature(
                             dec_masks_for_guidance,
+                            dec_guidance_pred_temperature,
+                            normalize_dim=1,
+                        )
+                        dec_target = _apply_distribution_temperature(
+                            dec_target,
+                            dec_guidance_target_temperature,
+                            normalize_dim=1,
+                        )
+                        dec_guidance_loss = compute_mask_matching_loss(
+                            dec_pred,
                             dec_target,
                             loss_type=dec_guidance_loss_type,
                         )
@@ -874,6 +921,7 @@ def main():
 
                         if (
                             sa_guidance_enabled
+                            and global_step >= sa_guidance_start_step
                             and raw_slot_assignments is not None
                             and refined_slot_assignments is not None
                         ):
@@ -882,8 +930,18 @@ def main():
                                 if sa_guidance_target_detach
                                 else refined_slot_assignments
                             )
-                            sa_loss_val = compute_distribution_matching_loss(
+                            sa_pred = _apply_distribution_temperature(
                                 raw_slot_assignments,
+                                sa_guidance_pred_temperature,
+                                normalize_dim=-1,
+                            )
+                            sa_target = _apply_distribution_temperature(
+                                sa_target,
+                                sa_guidance_target_temperature,
+                                normalize_dim=-1,
+                            )
+                            sa_loss_val = compute_distribution_matching_loss(
+                                sa_pred,
                                 sa_target,
                                 loss_type=sa_guidance_loss_type,
                                 normalize_dim=-1,
@@ -892,6 +950,7 @@ def main():
 
                         if (
                             dec_guidance_enabled
+                            and global_step >= dec_guidance_start_step
                             and dec_masks is not None
                             and refined_slot_assignments is not None
                         ):
@@ -902,8 +961,18 @@ def main():
                                 crf_masks = crf_masks[:, :min_slots]
                                 dec_masks_for_guidance = dec_masks_for_guidance[:, :min_slots]
                             dec_target = crf_masks.detach() if dec_guidance_target_detach else crf_masks
-                            dec_loss_val = compute_mask_matching_loss(
+                            dec_pred = _apply_distribution_temperature(
                                 dec_masks_for_guidance,
+                                dec_guidance_pred_temperature,
+                                normalize_dim=1,
+                            )
+                            dec_target = _apply_distribution_temperature(
+                                dec_target,
+                                dec_guidance_target_temperature,
+                                normalize_dim=1,
+                            )
+                            dec_loss_val = compute_mask_matching_loss(
+                                dec_pred,
                                 dec_target,
                                 loss_type=dec_guidance_loss_type,
                             )

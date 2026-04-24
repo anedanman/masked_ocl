@@ -58,10 +58,16 @@ BASE_CRF: Dict[str, Any] = {
         "similarity": "cosine",
         "normalize_features": True,
     },
+    "compatibility": {
+        "type": "potts",
+    },
     "slot_attention": {
         "mode": "disabled",
         "apply_every_iteration": False,
         "ste_grad": False,
+        "ste_grad_scale": 1.0,
+        "detach_refined": False,
+        "detach_refined_except_final": False,
         "blend": 0.5,
         "return_refined_attn": True,
     },
@@ -447,12 +453,22 @@ def collect_run_row(repo_root: Path, config_path: Path) -> Dict[str, Any]:
         "best_val_metrics_step": summary.get("best_val_metrics_step", None),
         "best_val_loss_step": summary.get("best_val_loss_step", None),
         "latest_val_loss": None,
+        "latest_val_metrics_avg": None,
+        "latest_val_instance_sa_mbo_i": None,
+        "latest_val_instance_decoder_mbo_i": None,
+        "latest_val_semantic_sa_mbo_c": None,
+        "latest_val_semantic_decoder_mbo_c": None,
         "latest_crf_slot_guidance_loss": None,
         "latest_crf_decoder_guidance_loss": None,
     }
     latest = summary.get("latest_validation", {})
     if isinstance(latest, dict):
         row["latest_val_loss"] = latest.get("val/loss", None)
+        row["latest_val_metrics_avg"] = latest.get("val/metrics_avg", None)
+        row["latest_val_instance_sa_mbo_i"] = latest.get("val_instance/sa/mBO_i", None)
+        row["latest_val_instance_decoder_mbo_i"] = latest.get("val_instance/decoder/mBO_i", None)
+        row["latest_val_semantic_sa_mbo_c"] = latest.get("val_semantic/sa/mBO_c", None)
+        row["latest_val_semantic_decoder_mbo_c"] = latest.get("val_semantic/decoder/mBO_c", None)
         row["latest_crf_slot_guidance_loss"] = latest.get("val/crf_slot_guidance_loss", None)
         row["latest_crf_decoder_guidance_loss"] = latest.get("val/crf_decoder_guidance_loss", None)
     row.update(extract_crf_fields(cfg))
@@ -480,6 +496,14 @@ def sort_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
+def fmt(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    return str(value)
+
+
 def write_summary(repo_root: Path, rows: List[Dict[str, Any]]) -> Path:
     summary_dir = (repo_root / "runs" / "slot-ar" / "_crf_summary").resolve()
     summary_dir.mkdir(parents=True, exist_ok=True)
@@ -504,19 +528,23 @@ def write_summary(repo_root: Path, rows: List[Dict[str, Any]]) -> Path:
         handle.write(f"Tracked runs: {len(rows)}\n\n")
         if rows:
             handle.write(
-                "| Rank | Config | Status | Best Metric Avg | Best Val Loss | Mode | All Iters | STE | Top-k | SA Loss | Dec Loss |\n"
+                "| Rank | Config | Status | Best Metric Avg | Latest mBO_i SA | Latest mBO_i Dec | Latest mBO_c SA | Latest mBO_c Dec | Best Val Loss | Mode | All Iters | STE | Top-k | SA Loss | Dec Loss |\n"
             )
             handle.write(
-                "| --- | --- | --- | ---: | ---: | --- | --- | --- | ---: | --- | --- |\n"
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | --- | --- |\n"
             )
             for idx, row in enumerate(rows, start=1):
                 handle.write(
-                    "| {rank} | {config} | {status} | {metric} | {loss} | {mode} | {all_iters} | {ste} | {topk} | {sa_loss} | {dec_loss} |\n".format(
+                    "| {rank} | {config} | {status} | {metric} | {mbo_i_sa} | {mbo_i_dec} | {mbo_c_sa} | {mbo_c_dec} | {loss} | {mode} | {all_iters} | {ste} | {topk} | {sa_loss} | {dec_loss} |\n".format(
                         rank=idx,
                         config=row.get("config", ""),
                         status=row.get("status", ""),
-                        metric=row.get("best_val_metrics_avg", "n/a"),
-                        loss=row.get("best_val_loss", "n/a"),
+                        metric=fmt(row.get("best_val_metrics_avg")),
+                        mbo_i_sa=fmt(row.get("latest_val_instance_sa_mbo_i")),
+                        mbo_i_dec=fmt(row.get("latest_val_instance_decoder_mbo_i")),
+                        mbo_c_sa=fmt(row.get("latest_val_semantic_sa_mbo_c")),
+                        mbo_c_dec=fmt(row.get("latest_val_semantic_decoder_mbo_c")),
+                        loss=fmt(row.get("best_val_loss")),
                         mode=row.get("crf_slot_mode", "off"),
                         all_iters=row.get("crf_apply_every_iteration", False),
                         ste=row.get("crf_ste_grad", False),
