@@ -135,14 +135,10 @@ crf:
     similarity: cosine
     normalize_features: true
   compatibility:
-    type: transformer_product
+    type: cosine_mlp
     hidden_dim: 512
     projection_dim: 128
-    num_layers: 4
-    num_heads: 8
-    dropout: 0.0
-    output_norm: l2
-    transform: softplus_product
+    transform: one_minus_cosine
     temperature: 1.0
     detach_slots: false
     symmetrize: true
@@ -203,5 +199,5 @@ wandb:
 output:
   dir: runs
 experiment:
-  hypothesis: 'transformer compatibility: SA and cross-attention CRF with delayed
-    decoder guidance'
+  hypothesis: 'MLP compatibility: SA and cross-attention CRF with delayed decoder
+    guidance'

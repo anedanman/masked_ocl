@@ -99,15 +99,11 @@ BASE_CRF: Dict[str, Any] = {
 }
 
 
-TRANSFORMER_COMPAT: Dict[str, Any] = {
-    "type": "transformer_product",
+MLP_COMPAT: Dict[str, Any] = {
+    "type": "cosine_mlp",
     "hidden_dim": 512,
     "projection_dim": 128,
-    "num_layers": 4,
-    "num_heads": 8,
-    "dropout": 0.0,
-    "output_norm": "l2",
-    "transform": "softplus_product",
+    "transform": "one_minus_cosine",
     "temperature": 1.0,
     "detach_slots": False,
     "symmetrize": True,
@@ -246,17 +242,17 @@ POTTS_PRESETS: List[Dict[str, Any]] = [
 ]
 
 
-TRANSFORMER_PRESETS: List[Dict[str, Any]] = []
+MLP_PRESETS: List[Dict[str, Any]] = []
 for idx, preset in enumerate(POTTS_PRESETS[1:], start=11):
     suffix = preset["id"].split("_", 1)[1]
-    TRANSFORMER_PRESETS.append(
+    MLP_PRESETS.append(
         {
             **copy.deepcopy(preset),
             "id": f"{idx:02d}_{suffix}",
-            "title": f"transformer compatibility: {preset['title']}",
+            "title": f"MLP compatibility: {preset['title']}",
             "overrides": deep_update(
                 copy.deepcopy(preset["overrides"]),
-                {"crf": {"compatibility": TRANSFORMER_COMPAT}},
+                {"crf": {"compatibility": MLP_COMPAT}},
             ),
         }
     )
