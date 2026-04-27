@@ -77,6 +77,38 @@ from src.utils import (
 from train_optimized import prepare_dataloaders, maybe_compile_optimized, compute_grad_norm
 
 
+class CombinedOptimizer(torch.optim.Optimizer):
+    def __init__(self, optimizers: List[torch.optim.Optimizer]) -> None:
+        self.optimizers = optimizers
+        self.param_groups = [group for optim in optimizers for group in optim.param_groups]
+        self.defaults = {}
+        self.state = {}
+
+    def step(self, closure=None):  # type: ignore[override]
+        loss = None
+        for optim in self.optimizers:
+            result = optim.step(closure=closure) if closure is not None else optim.step()
+            if result is not None:
+                loss = result
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
+        for optim in self.optimizers:
+            optim.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):  # type: ignore[override]
+        return {"optimizers": [optim.state_dict() for optim in self.optimizers]}
+
+    def load_state_dict(self, state_dict):  # type: ignore[override]
+        states = state_dict.get("optimizers", None) if isinstance(state_dict, dict) else None
+        if states is None:
+            raise ValueError("CombinedOptimizer state must contain an 'optimizers' list.")
+        if len(states) != len(self.optimizers):
+            raise ValueError("CombinedOptimizer state does not match optimizer count.")
+        for optim, state in zip(self.optimizers, states):
+            optim.load_state_dict(state)
+
+
 def _gather_gt_tokens(features: torch.Tensor, pred_indices: torch.Tensor) -> torch.Tensor:
     gt_tokens = rearrange(features, "b c h w -> b (h w) c")
     return torch.gather(gt_tokens, 1, pred_indices.unsqueeze(-1).expand(-1, -1, gt_tokens.shape[-1]))
@@ -270,17 +302,33 @@ def main():
         train_cfg.get("optimizer", optimizer_cfg.get("name", optimizer_cfg.get("type", "adamw")))
     ).lower()
     if optimizer_name == "muon":
-        from timm.optim.muon import Muon
-
-        optim = Muon(
-            params,
-            lr=lr,
-            weight_decay=weight_decay,
-            momentum=float(optimizer_cfg.get("momentum", 0.95)),
-            nesterov=bool(optimizer_cfg.get("nesterov", False)),
-            ns_steps=int(optimizer_cfg.get("ns_steps", 5)),
-            adamw_lr=optimizer_cfg.get("adamw_lr", None),
-            betas=tuple(optimizer_cfg.get("betas", (0.9, 0.95))),
+        muon_params = [p for p in params if p.requires_grad and p.ndim >= 2]
+        adamw_params = [p for p in params if p.requires_grad and p.ndim < 2]
+        optimizers: List[torch.optim.Optimizer] = []
+        if muon_params:
+            optimizers.append(
+                torch.optim.Muon(
+                    muon_params,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    momentum=float(optimizer_cfg.get("momentum", 0.95)),
+                    nesterov=bool(optimizer_cfg.get("nesterov", True)),
+                    ns_steps=int(optimizer_cfg.get("ns_steps", 5)),
+                    adjust_lr_fn=optimizer_cfg.get("adjust_lr_fn", None),
+                )
+            )
+        if adamw_params:
+            optimizers.append(
+                torch.optim.AdamW(
+                    adamw_params,
+                    lr=float(optimizer_cfg.get("adamw_lr", lr)),
+                    weight_decay=weight_decay,
+                )
+            )
+        optim = CombinedOptimizer(optimizers)
+        print(
+            f"Using torch.optim.Muon for {len(muon_params)} tensor params and AdamW fallback "
+            f"for {len(adamw_params)} vector/scalar params."
         )
     elif optimizer_name == "adamw":
         optim = torch.optim.AdamW(
