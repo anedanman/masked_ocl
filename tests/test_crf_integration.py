@@ -73,7 +73,7 @@ def test_token_feature_crf_supports_transformer_product_compatibility() -> None:
         compatibility_num_heads=4,
         compatibility_transform="softplus_product",
     )
-    assert crf.compatibility_output_norm == "rms"
+    assert crf.compatibility_output_norm == "l2"
     features = torch.randn(2, 8, 4, 4)
     slots = torch.randn(2, 3, 16)
     probs = torch.softmax(torch.randn(2, 16, 3), dim=-1)

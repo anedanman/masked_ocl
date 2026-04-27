@@ -110,7 +110,7 @@ class TokenFeatureCRF(nn.Module):
             raise ValueError("compatibility_diagonal must be 'zero' or 'keep'.")
         output_norm = compatibility_output_norm
         if output_norm is None:
-            output_norm = "rms" if compatibility_type == "transformer_product" else "none"
+            output_norm = "l2" if compatibility_type == "transformer_product" else "none"
         self.compatibility_output_norm = str(output_norm).lower()
         if self.compatibility_output_norm in ("disabled", "false"):
             self.compatibility_output_norm = "none"

@@ -138,10 +138,10 @@ crf:
     type: transformer_product
     hidden_dim: 512
     projection_dim: 128
-    num_layers: 2
+    num_layers: 4
     num_heads: 8
     dropout: 0.0
-    output_norm: rms
+    output_norm: l2
     transform: softplus_product
     temperature: 1.0
     detach_slots: false
