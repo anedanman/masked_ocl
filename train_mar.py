@@ -265,11 +265,31 @@ def main():
     weight_decay = train_cfg.get("weight_decay", cfg.get("optimizer", {}).get("weight_decay", 1e-4))
 
     params = list(slot_attn.parameters()) + list(decoder.parameters())
-    optim = torch.optim.AdamW(
-        params,
-        lr=lr,
-        weight_decay=weight_decay,
-    )
+    optimizer_cfg = cfg.get("optimizer", {}) or {}
+    optimizer_name = str(
+        train_cfg.get("optimizer", optimizer_cfg.get("name", optimizer_cfg.get("type", "adamw")))
+    ).lower()
+    if optimizer_name == "muon":
+        from timm.optim.muon import Muon
+
+        optim = Muon(
+            params,
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=float(optimizer_cfg.get("momentum", 0.95)),
+            nesterov=bool(optimizer_cfg.get("nesterov", False)),
+            ns_steps=int(optimizer_cfg.get("ns_steps", 5)),
+            adamw_lr=optimizer_cfg.get("adamw_lr", None),
+            betas=tuple(optimizer_cfg.get("betas", (0.9, 0.95))),
+        )
+    elif optimizer_name == "adamw":
+        optim = torch.optim.AdamW(
+            params,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Expected 'adamw' or 'muon'.")
 
     autocast_kwargs = get_autocast_kwargs(device, train_cfg)
     data_cfg = cfg.get("data", {})

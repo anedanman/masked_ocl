@@ -111,6 +111,22 @@ MLP_COMPAT: Dict[str, Any] = {
 }
 
 
+TRANSFORMER_L2_COMPAT: Dict[str, Any] = {
+    "type": "transformer_product",
+    "hidden_dim": 512,
+    "projection_dim": 128,
+    "num_layers": 4,
+    "num_heads": 8,
+    "dropout": 0.0,
+    "output_norm": "l2",
+    "transform": "softplus_product",
+    "temperature": 1.0,
+    "detach_slots": False,
+    "symmetrize": True,
+    "diagonal": "zero",
+}
+
+
 def crf_with(*updates: dict) -> dict:
     cfg = copy.deepcopy(BASE_CRF)
     for update in updates:
@@ -243,6 +259,21 @@ POTTS_PRESETS: List[Dict[str, Any]] = [
 
 
 MLP_PRESETS: List[Dict[str, Any]] = []
+MLP_PRESETS.append(
+    {
+        **copy.deepcopy(POTTS_PRESETS[1]),
+        "id": "00_sa_crf_all_iters_transformer_l2_muon",
+        "title": "transformer L2 compatibility SA CRF all iterations with Muon",
+        "overrides": deep_update(
+            copy.deepcopy(POTTS_PRESETS[1]["overrides"]),
+            {
+                "crf": {"compatibility": TRANSFORMER_L2_COMPAT},
+                "train": {"learning_rate": 0.002},
+                "optimizer": {"name": "muon"},
+            },
+        ),
+    }
+)
 for idx, preset in enumerate(POTTS_PRESETS[1:], start=11):
     suffix = preset["id"].split("_", 1)[1]
     MLP_PRESETS.append(
