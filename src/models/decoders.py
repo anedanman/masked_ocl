@@ -1,6 +1,6 @@
 """Attention utilities for slot-based MAR models."""
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +60,7 @@ class QKNormalizedMultiheadAttention(nn.Module):
         need_weights: bool = True,
         attn_mask: Optional[torch.Tensor] = None,
         average_attn_weights: bool = True,
+        attn_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if not self.batch_first:
             query = query.transpose(0, 1)
@@ -100,6 +101,8 @@ class QKNormalizedMultiheadAttention(nn.Module):
             attn_scores = attn_scores.masked_fill(padding, min_value)
 
         attn = F.softmax(attn_scores, dim=-1)
+        if attn_transform is not None:
+            attn = attn_transform(attn)
         attn = self.dropout(attn)
         context = torch.matmul(attn, v)
         context = context.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)

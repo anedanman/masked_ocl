@@ -82,6 +82,32 @@ def _gather_gt_tokens(features: torch.Tensor, pred_indices: torch.Tensor) -> tor
     return torch.gather(gt_tokens, 1, pred_indices.unsqueeze(-1).expand(-1, -1, gt_tokens.shape[-1]))
 
 
+def _cross_teacher_to_slot_override(
+    decoder_info: Optional[dict],
+    attn_vis: torch.Tensor,
+    *,
+    stage: str,
+) -> Optional[torch.Tensor]:
+    if not decoder_info:
+        return None
+    cross_info = decoder_info.get("cross_attention", {}) or {}
+    stage = str(stage).lower()
+    if stage in ("raw", "before", "before_crf"):
+        teacher = cross_info.get("raw_assignments", None)
+    elif stage in ("refined", "after", "after_crf"):
+        teacher = cross_info.get("refined_assignments", None)
+    else:
+        teacher = cross_info.get("effective_assignments", None)
+    if teacher is None:
+        return None
+    if teacher.shape[0] != attn_vis.shape[0] or teacher.shape[1] != attn_vis.shape[2]:
+        return None
+    if teacher.shape[-1] != attn_vis.shape[-1]:
+        teacher = teacher[..., : attn_vis.shape[-1]]
+        teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    return teacher.unsqueeze(1).expand(-1, attn_vis.shape[1], -1, -1)
+
+
 def _linear_ramp_schedule(
     step: int,
     *,
@@ -340,6 +366,12 @@ def main():
     dec_guidance_start_step = int(
         dec_guidance_cfg.get("start_step", dec_guidance_cfg.get("enabled_after_step", 0))
     )
+    cross_to_slot_cfg = dict(crf_cfg.get("cross_to_slot_guidance", {}) or {})
+    cross_to_slot_enabled = crf_enabled and bool(cross_to_slot_cfg.get("enabled", False))
+    cross_to_slot_stage = str(cross_to_slot_cfg.get("teacher_stage", "raw")).lower()
+    cross_to_slot_guided_grad_substitute = bool(
+        cross_to_slot_cfg.get("guided_grad_substitute", True)
+    )
 
     sched_cfg = train_cfg.get("lr_schedule")
     if sched_cfg is None:
@@ -448,7 +480,7 @@ def main():
         dec_guidance_loss_total = 0.0
         dec_guidance_loss_count = 0
         crf_stat_totals: Dict[str, float] = {}
-        crf_stat_count = 0
+        crf_stat_counts: Dict[str, int] = {}
         mask_ratio_total = 0.0
         random_order_prob_total = 0.0
         random_order_frac_total = 0.0
@@ -522,12 +554,35 @@ def main():
                     )
                 else:
                     slots, attn_vis, init_loss = slot_attn(feats, cls_token=cls_token)
+
                 if decoder_uses_masking:
                     # Pre-compute the sampled ratio outside the decoder to avoid
                     # recompilation from passing a fresh Python float into a compiled module.
                     mask_ratio = decoder._sample_mask_ratio()
                     mask_len = max(1, min(num_tokens, int(num_tokens * mask_ratio + 0.9999)))
-                    output = decoder(feats, slots, attn_vis, mask_len=mask_len)
+                    if cross_to_slot_enabled:
+                        with torch.no_grad():
+                            teacher_output = decoder(
+                                feats,
+                                slots,
+                                attn_vis,
+                                mask_len=mask_len,
+                                slot_info=slot_info,
+                            )
+                        attn_override = _cross_teacher_to_slot_override(
+                            teacher_output.info,
+                            attn_vis,
+                            stage=cross_to_slot_stage,
+                        )
+                        if attn_override is not None:
+                            slots, attn_vis, init_loss, slot_info = slot_attn(
+                                feats,
+                                cls_token=cls_token,
+                                attn_override=attn_override,
+                                guided_grad_substitute=cross_to_slot_guided_grad_substitute,
+                                return_info=True,
+                            )
+                    output = decoder(feats, slots, attn_vis, mask_len=mask_len, slot_info=slot_info)
                 else:
                     if hasattr(decoder, "sample_training_order"):
                         order, order_is_random, random_order_prob = decoder.sample_training_order(
@@ -541,7 +596,29 @@ def main():
                         random_order_measure_count += 1
                     else:
                         order = decoder._sample_orders(B, num_tokens, device=device)
-                    output = decoder(feats, slots, attn_vis, order=order)
+                    if cross_to_slot_enabled:
+                        with torch.no_grad():
+                            teacher_output = decoder(
+                                feats,
+                                slots,
+                                attn_vis,
+                                order=order,
+                                slot_info=slot_info,
+                            )
+                        attn_override = _cross_teacher_to_slot_override(
+                            teacher_output.info,
+                            attn_vis,
+                            stage=cross_to_slot_stage,
+                        )
+                        if attn_override is not None:
+                            slots, attn_vis, init_loss, slot_info = slot_attn(
+                                feats,
+                                cls_token=cls_token,
+                                attn_override=attn_override,
+                                guided_grad_substitute=cross_to_slot_guided_grad_substitute,
+                                return_info=True,
+                            )
+                    output = decoder(feats, slots, attn_vis, order=order, slot_info=slot_info)
                 gt_pred = _gather_gt_tokens(feats, output.pred_indices)
                 loss = F.mse_loss(output.predictions, gt_pred)
                 if init_loss is not None:
@@ -549,6 +626,15 @@ def main():
                 dec_masks = output.decoder_masks
                 if dec_masks is not None and dec_masks.shape[1] != slots.shape[1]:
                     dec_masks = dec_masks[:, : slots.shape[1]]
+
+                output_info = output.info or {}
+                cross_info = output_info.get("cross_attention", {}) or {}
+                cross_crf_stats = cross_info.get("crf_stats", {}) or {}
+                if cross_crf_stats:
+                    for stat_name, stat_value in cross_crf_stats.items():
+                        key = f"cross/{stat_name}"
+                        crf_stat_totals[key] = crf_stat_totals.get(key, 0.0) + float(stat_value)
+                        crf_stat_counts[key] = crf_stat_counts.get(key, 0) + 1
 
                 raw_slot_assignments = None
                 refined_slot_assignments = None
@@ -561,7 +647,7 @@ def main():
                             crf_stat_totals[stat_name] = crf_stat_totals.get(stat_name, 0.0) + float(
                                 stat_value.detach().item()
                             )
-                        crf_stat_count += 1
+                            crf_stat_counts[stat_name] = crf_stat_counts.get(stat_name, 0) + 1
 
                 if mask_match_enabled and dec_masks is not None:
                     sa_masks = attn_to_slot_masks(attn_vis, Hf, Wf)
@@ -708,8 +794,11 @@ def main():
             else None
         )
         avg_crf_stats = (
-            {name: total / crf_stat_count for name, total in crf_stat_totals.items()}
-            if crf_stat_count > 0
+            {
+                name: total / max(crf_stat_counts.get(name, 1), 1)
+                for name, total in crf_stat_totals.items()
+            }
+            if crf_stat_totals
             else {}
         )
 
@@ -850,7 +939,7 @@ def main():
                 val_sa_guidance_losses: List[float] = []
                 val_dec_guidance_losses: List[float] = []
                 val_crf_stat_totals: Dict[str, float] = {}
-                val_crf_stat_count = 0
+                val_crf_stat_counts: Dict[str, int] = {}
                 viz_grids: List[torch.Tensor] = []
                 viz_target = int(cfg.get("wandb", {}).get("val_viz_count", 16)) if use_wandb else 0
                 target_metrics_active: Dict[str, bool] = {name: False for name in metrics_val}
@@ -885,6 +974,26 @@ def main():
                             )
                         else:
                             slots, attn_vis, _ = slot_attn(feats, cls_token=cls_token)
+                        if cross_to_slot_enabled:
+                            teacher_output = decoder(
+                                feats,
+                                slots,
+                                attn_vis,
+                                slot_info=slot_info,
+                            )
+                            attn_override = _cross_teacher_to_slot_override(
+                                teacher_output.info,
+                                attn_vis,
+                                stage=cross_to_slot_stage,
+                            )
+                            if attn_override is not None:
+                                slots, attn_vis, _, slot_info = slot_attn(
+                                    feats,
+                                    cls_token=cls_token,
+                                    attn_override=attn_override,
+                                    guided_grad_substitute=cross_to_slot_guided_grad_substitute,
+                                    return_info=True,
+                                )
                         if val_iterative:
                             iterative_steps = val_iterative_steps
                             if model_type == "ar" and not val_iterative_teacher_force:
@@ -901,12 +1010,24 @@ def main():
                             val_losses.append(float(F.mse_loss(recon, feats).item()))
                             dec_masks = iter_masks
                         else:
-                            output = decoder(feats, slots, attn_vis)
+                            output = decoder(feats, slots, attn_vis, slot_info=slot_info)
                             gt_pred = _gather_gt_tokens(feats, output.pred_indices)
                             val_losses.append(float(F.mse_loss(output.predictions, gt_pred).item()))
                             dec_masks = output.decoder_masks
                         if dec_masks is not None and dec_masks.shape[1] != slots.shape[1]:
                             dec_masks = dec_masks[:, : slots.shape[1]]
+
+                        if not val_iterative:
+                            output_info = output.info or {}
+                            cross_info = output_info.get("cross_attention", {}) or {}
+                            cross_crf_stats = cross_info.get("crf_stats", {}) or {}
+                            if cross_crf_stats:
+                                for stat_name, stat_value in cross_crf_stats.items():
+                                    key = f"cross/{stat_name}"
+                                    val_crf_stat_totals[key] = val_crf_stat_totals.get(key, 0.0) + float(
+                                        stat_value
+                                    )
+                                    val_crf_stat_counts[key] = val_crf_stat_counts.get(key, 0) + 1
 
                     if slot_info is not None:
                         raw_slot_assignments = slot_info.get("raw_assignments", None)
@@ -917,7 +1038,7 @@ def main():
                                 val_crf_stat_totals[stat_name] = val_crf_stat_totals.get(stat_name, 0.0) + float(
                                     stat_value.detach().item()
                                 )
-                            val_crf_stat_count += 1
+                                val_crf_stat_counts[stat_name] = val_crf_stat_counts.get(stat_name, 0) + 1
 
                         if (
                             sa_guidance_enabled
@@ -1025,9 +1146,11 @@ def main():
                     results["val/crf_decoder_guidance_loss"] = float(
                         sum(val_dec_guidance_losses) / len(val_dec_guidance_losses)
                     )
-                if val_crf_stat_count > 0:
+                if val_crf_stat_totals:
                     for stat_name, total in val_crf_stat_totals.items():
-                        results[f"val/crf/{stat_name}"] = float(total / val_crf_stat_count)
+                        results[f"val/crf/{stat_name}"] = float(
+                            total / max(val_crf_stat_counts.get(stat_name, 1), 1)
+                        )
                 metric_values_for_avg: List[float] = []
 
                 for target_name, metric_group in metrics_val.items():

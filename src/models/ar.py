@@ -44,6 +44,7 @@ class SlotARDecoder(SlotMARDecoder):
         random_order_prob_start_step: int = 0,
         random_order_prob_end: float = 1.0,
         random_order_prob_end_step: int = 0,
+        token_crf_cfg: Optional[dict] = None,
     ) -> None:
         attn_mode = str(self_attn_type).lower()
         if attn_mode not in ("causal", "autoregressive", "ar"):
@@ -84,6 +85,7 @@ class SlotARDecoder(SlotMARDecoder):
             use_torch_sampling=True,
             slot_cross_mlp=slot_cross_mlp,
             slot_cross_mlp_skip=slot_cross_mlp_skip,
+            token_crf_cfg=token_crf_cfg,
         )
 
         self.random_order_prob_start = float(random_order_prob_start)
@@ -156,6 +158,7 @@ class SlotARDecoder(SlotMARDecoder):
         known_tokens: Optional[torch.Tensor] = None,
         mask_ratio: Optional[float] = None,
         mask_len: Optional[int] = None,
+        slot_info: Optional[dict] = None,
     ) -> SlotMAROutput:
         # These kwargs are accepted only to preserve the shared decoder interface used by
         # the trainer and validation code. The AR objective ignores MAR-style masking.
@@ -248,8 +251,25 @@ class SlotARDecoder(SlotMARDecoder):
         dec_mask = self._build_causal_mask(seq_input.shape[1], device=device)
         cross_sum: Optional[torch.Tensor] = None
         dec_input = seq_input
-        for block in self.decoder_blocks:
-            dec_input, cross_weights = block(dec_input, slots_kv, attn_mask=dec_mask, need_weights=True)
+        cross_info: dict = {}
+        for layer_index, block in enumerate(self.decoder_blocks):
+            cross_transform = self._make_cross_attn_transform(
+                feats=feats,
+                slots=slots,
+                query_indices=order,
+                num_tokens=num_tokens,
+                num_slots=num_slots,
+                slot_info=slot_info,
+                info=cross_info,
+                layer_index=layer_index,
+            )
+            dec_input, cross_weights = block(
+                dec_input,
+                slots_kv,
+                attn_mask=dec_mask,
+                need_weights=True,
+                cross_attn_transform=cross_transform,
+            )
             if cross_weights is not None:
                 cross_sum = cross_weights if cross_sum is None else cross_sum + cross_weights
 
@@ -275,6 +295,7 @@ class SlotARDecoder(SlotMARDecoder):
             mask=torch.ones(bsz, num_tokens, device=device, dtype=torch.bool),
             order=order,
             decoder_masks=decoder_masks,
+            info={"cross_attention": self._finalize_cross_crf_info(cross_info)},
         )
 
     @torch.no_grad()

@@ -229,6 +229,9 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                 compatibility_detach_slots=bool(compatibility_cfg.get("detach_slots", False)),
                 compatibility_symmetrize=bool(compatibility_cfg.get("symmetrize", True)),
                 compatibility_diagonal=str(compatibility_cfg.get("diagonal", "zero")),
+                compatibility_num_layers=int(compatibility_cfg.get("num_layers", 2)),
+                compatibility_num_heads=int(compatibility_cfg.get("num_heads", 4)),
+                compatibility_dropout=float(compatibility_cfg.get("dropout", 0.0)),
                 eps=float(token_crf_cfg.get("eps", epsilon)),
             )
 
@@ -300,8 +303,22 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             effective = effective.detach() + scale * (raw_attn_vis - raw_attn_vis.detach())
         return effective
         
-    def forward(self, inputs, *, cls_token: Optional[torch.Tensor] = None, return_info: bool = False):
-        result = self.forward_slots(inputs, cls_token=cls_token, return_info=return_info)
+    def forward(
+        self,
+        inputs,
+        *,
+        cls_token: Optional[torch.Tensor] = None,
+        attn_override: Optional[torch.Tensor] = None,
+        guided_grad_substitute: bool = False,
+        return_info: bool = False,
+    ):
+        result = self.forward_slots(
+            inputs,
+            cls_token=cls_token,
+            attn_override=attn_override,
+            guided_grad_substitute=guided_grad_substitute,
+            return_info=return_info,
+        )
         if return_info:
             slots, attns, init_loss, info = result
         else:

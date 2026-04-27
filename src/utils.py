@@ -790,6 +790,7 @@ def build_slot_model_components(cfg: Dict[str, Any], device: torch.device):
         "max_seq_len": max_seq_len,
         "slot_cross_mlp": bool(decoder_cfg.get("slot_cross_mlp", False)),
         "slot_cross_mlp_skip": bool(decoder_cfg.get("slot_cross_mlp_skip", True)),
+        "token_crf_cfg": cfg.get("crf", {}),
     }
 
     if model_type == "ar":

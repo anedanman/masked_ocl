@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -47,6 +48,9 @@ class TokenFeatureCRF(nn.Module):
         compatibility_detach_slots: bool = False,
         compatibility_symmetrize: bool = True,
         compatibility_diagonal: str = "zero",
+        compatibility_num_layers: int = 2,
+        compatibility_num_heads: int = 4,
+        compatibility_dropout: float = 0.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -74,9 +78,13 @@ class TokenFeatureCRF(nn.Module):
             "none": "potts",
             "learned_cosine": "cosine_mlp",
             "slot_cosine": "cosine_mlp",
+            "transformer": "transformer_product",
+            "transformer_dot": "transformer_product",
         }.get(compatibility_type, compatibility_type)
-        if compatibility_type not in ("potts", "cosine_mlp"):
-            raise ValueError("compatibility_type must be 'potts' or 'cosine_mlp'.")
+        if compatibility_type not in ("potts", "cosine_mlp", "transformer_product"):
+            raise ValueError(
+                "compatibility_type must be 'potts', 'cosine_mlp', or 'transformer_product'."
+            )
         self.compatibility_type = compatibility_type
         self.compatibility_transform = str(compatibility_transform).lower()
         if self.compatibility_transform not in (
@@ -84,10 +92,14 @@ class TokenFeatureCRF(nn.Module):
             "cosine",
             "negative_cosine",
             "softplus_negative_cosine",
+            "product",
+            "negative_product",
+            "softplus_product",
         ):
             raise ValueError(
                 "compatibility_transform must be one of: "
-                "one_minus_cosine, cosine, negative_cosine, softplus_negative_cosine."
+                "one_minus_cosine, cosine, negative_cosine, softplus_negative_cosine, "
+                "product, negative_product, softplus_product."
             )
         self.compatibility_temperature = float(compatibility_temperature)
         self.compatibility_detach_slots = bool(compatibility_detach_slots)
@@ -96,6 +108,7 @@ class TokenFeatureCRF(nn.Module):
         if self.compatibility_diagonal not in ("zero", "keep"):
             raise ValueError("compatibility_diagonal must be 'zero' or 'keep'.")
         self.slot_compat_mlp: Optional[nn.Module] = None
+        self.slot_compat_transformer: Optional[nn.Module] = None
         if self.compatibility_type == "cosine_mlp":
             if slot_size is None:
                 raise ValueError("slot_size is required for cosine_mlp CRF compatibility.")
@@ -107,6 +120,33 @@ class TokenFeatureCRF(nn.Module):
                 nn.LayerNorm(int(slot_size)),
                 nn.Linear(int(slot_size), hidden_dim),
                 nn.GELU(),
+                nn.Linear(hidden_dim, projection_dim),
+            )
+        elif self.compatibility_type == "transformer_product":
+            if slot_size is None:
+                raise ValueError("slot_size is required for transformer_product CRF compatibility.")
+            hidden_dim = int(compatibility_hidden_dim or slot_size)
+            projection_dim = int(compatibility_projection_dim)
+            num_layers = max(1, int(compatibility_num_layers))
+            num_heads = max(1, int(compatibility_num_heads))
+            if hidden_dim <= 0 or projection_dim <= 0:
+                raise ValueError("compatibility hidden/projection dimensions must be positive.")
+            if hidden_dim % num_heads != 0:
+                raise ValueError("compatibility hidden_dim must be divisible by num_heads.")
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=max(hidden_dim * 4, hidden_dim),
+                dropout=float(compatibility_dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.slot_compat_transformer = nn.Sequential(
+                nn.LayerNorm(int(slot_size)),
+                nn.Linear(int(slot_size), hidden_dim),
+                nn.TransformerEncoder(encoder_layer, num_layers=num_layers),
+                nn.LayerNorm(hidden_dim),
                 nn.Linear(hidden_dim, projection_dim),
             )
         self.eps = float(eps)
@@ -279,28 +319,45 @@ class TokenFeatureCRF(nn.Module):
     ) -> Optional[torch.Tensor]:
         if self.compatibility_type == "potts":
             return None
-        if self.slot_compat_mlp is None or slot_embeddings is None:
-            raise ValueError("slot_embeddings are required for cosine_mlp CRF compatibility.")
+        if slot_embeddings is None:
+            raise ValueError("slot_embeddings are required for learned CRF compatibility.")
         if slot_embeddings.ndim != 3 or slot_embeddings.shape[1] != num_slots:
             raise ValueError(
                 f"slot_embeddings must have shape [B, {num_slots}, D], got {tuple(slot_embeddings.shape)}."
             )
 
         slots = slot_embeddings.detach() if self.compatibility_detach_slots else slot_embeddings
-        projected = self.slot_compat_mlp(slots.float())
-        projected = F.normalize(projected, dim=-1, eps=self.eps)
-        cosine = torch.matmul(projected, projected.transpose(1, 2)).clamp(-1.0, 1.0)
-        if self.compatibility_symmetrize:
-            cosine = 0.5 * (cosine + cosine.transpose(1, 2))
-
-        if self.compatibility_transform == "one_minus_cosine":
-            compat = 0.5 * (1.0 - cosine)
-        elif self.compatibility_transform == "cosine":
-            compat = cosine
-        elif self.compatibility_transform == "negative_cosine":
-            compat = -cosine
+        slots = slots.float()
+        if self.compatibility_type == "cosine_mlp":
+            if self.slot_compat_mlp is None:
+                raise RuntimeError("slot_compat_mlp was not initialized.")
+            projected = self.slot_compat_mlp(slots)
+            projected = F.normalize(projected, dim=-1, eps=self.eps)
+            sim = torch.matmul(projected, projected.transpose(1, 2)).clamp(-1.0, 1.0)
+            if self.compatibility_symmetrize:
+                sim = 0.5 * (sim + sim.transpose(1, 2))
+            if self.compatibility_transform == "one_minus_cosine":
+                compat = 0.5 * (1.0 - sim)
+            elif self.compatibility_transform == "cosine":
+                compat = sim
+            elif self.compatibility_transform == "negative_cosine":
+                compat = -sim
+            else:
+                compat = F.softplus(-sim)
         else:
-            compat = F.softplus(-cosine)
+            if self.slot_compat_transformer is None:
+                raise RuntimeError("slot_compat_transformer was not initialized.")
+            projected = self.slot_compat_transformer(slots)
+            scale = math.sqrt(max(projected.shape[-1], 1))
+            sim = torch.matmul(projected, projected.transpose(1, 2)) / scale
+            if self.compatibility_symmetrize:
+                sim = 0.5 * (sim + sim.transpose(1, 2))
+            if self.compatibility_transform == "negative_product":
+                compat = -sim
+            elif self.compatibility_transform == "product":
+                compat = sim
+            else:
+                compat = F.softplus(sim)
 
         compat = compat / max(self.compatibility_temperature, self.eps)
         if self.compatibility_diagonal == "zero":

@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,7 @@ except ImportError:
     _SCIPY_AVAILABLE = False
 
 from src.models.decoders import QKNormalizedMultiheadAttention
+from src.models.token_crf import TokenFeatureCRF
 
 
 def _torch_truncnorm_sample(
@@ -50,6 +51,7 @@ class SlotMAROutput:
     mask: torch.Tensor
     order: torch.Tensor
     decoder_masks: Optional[torch.Tensor] = None
+    info: Optional[dict] = None
 
 
 class _MARSelfAttentionBlock(nn.Module):
@@ -165,6 +167,7 @@ class _MARDecoderBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = True,
+        cross_attn_transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         h = self.self_ln(tokens)
         self_out, _ = self.self_attn(
@@ -188,6 +191,7 @@ class _MARDecoderBlock(nn.Module):
             slots_kv,
             need_weights=need_weights,
             average_attn_weights=False,
+            attn_transform=cross_attn_transform,
         )
         tokens = tokens + self.cross_drop(cross_out)
 
@@ -237,6 +241,7 @@ class SlotMARDecoder(nn.Module):
         use_torch_sampling: bool = True,
         slot_cross_mlp: bool = False,
         slot_cross_mlp_skip: bool = True,
+        token_crf_cfg: Optional[dict] = None,
     ) -> None:
         super().__init__()
         model_dim = model_dim or slot_size
@@ -406,11 +411,260 @@ class SlotMARDecoder(nn.Module):
         else:
             self.slot_embed_mlp = None
 
+        self.cross_token_crf = None
+        self.cross_token_crf_mode = "off"
+        self.cross_token_crf_apply_all_layers = True
+        self.cross_token_crf_return_refined_attn = True
+        self.cross_token_crf_blend = 0.5
+        self.cross_token_crf_teacher_source = "none"
+        self.cross_token_crf_teacher_stage = "raw"
+        self.cross_token_crf_teacher_apply_crf = False
+        self.cross_token_crf_guided_grad_substitute = True
+
+        token_crf_cfg = dict(token_crf_cfg or {})
+        if bool(token_crf_cfg.get("enabled", False)):
+            cross_cfg = dict(token_crf_cfg.get("cross_attention", {}) or {})
+            mode = str(cross_cfg.get("mode", "disabled")).lower()
+            mode = {"disabled": "off", "false": "off", "none": "off"}.get(mode, mode)
+            if mode not in ("off", "replace", "blend"):
+                raise ValueError(
+                    "crf.cross_attention.mode must be 'disabled', 'replace', or 'blend'."
+                )
+            self.cross_token_crf_mode = mode
+            self.cross_token_crf_apply_all_layers = bool(cross_cfg.get("apply_all_layers", True))
+            self.cross_token_crf_return_refined_attn = bool(
+                cross_cfg.get("return_refined_attn", True)
+            )
+            self.cross_token_crf_blend = float(cross_cfg.get("blend", 0.5))
+            self.cross_token_crf_teacher_source = str(cross_cfg.get("teacher_source", "none")).lower()
+            self.cross_token_crf_teacher_stage = str(cross_cfg.get("teacher_stage", "raw")).lower()
+            self.cross_token_crf_teacher_apply_crf = bool(cross_cfg.get("teacher_apply_crf", False))
+            self.cross_token_crf_guided_grad_substitute = bool(
+                cross_cfg.get("guided_grad_substitute", True)
+            )
+            if self.cross_token_crf_mode != "off" or self.cross_token_crf_teacher_source not in (
+                "none",
+                "disabled",
+                "off",
+            ):
+                spatial_cfg = dict(token_crf_cfg.get("spatial", {}) or {})
+                appearance_cfg = dict(token_crf_cfg.get("appearance", {}) or {})
+                compatibility_cfg = dict(token_crf_cfg.get("compatibility", {}) or {})
+                spatial_enabled = bool(spatial_cfg.get("enabled", True))
+                appearance_enabled = bool(appearance_cfg.get("enabled", True))
+                self.cross_token_crf = TokenFeatureCRF(
+                    num_iterations=int(token_crf_cfg.get("num_iterations", 5)),
+                    spatial_weight=(
+                        float(spatial_cfg.get("weight", 3.0)) if spatial_enabled else 0.0
+                    ),
+                    spatial_sigma=float(spatial_cfg.get("sigma", 1.5)),
+                    appearance_weight=(
+                        float(appearance_cfg.get("weight", 6.0)) if appearance_enabled else 0.0
+                    ),
+                    appearance_sigma=float(appearance_cfg.get("sigma", 0.35)),
+                    appearance_spatial_sigma=float(
+                        appearance_cfg.get("spatial_sigma", 2.5)
+                    ),
+                    pairwise_topk=token_crf_cfg.get("pairwise_topk", None),
+                    exclude_self=bool(token_crf_cfg.get("exclude_self", True)),
+                    similarity=str(appearance_cfg.get("similarity", "cosine")),
+                    normalize_features=bool(appearance_cfg.get("normalize_features", True)),
+                    detach_features=bool(token_crf_cfg.get("detach_features", True)),
+                    unary_temperature=float(token_crf_cfg.get("unary_temperature", 1.0)),
+                    slot_size=slot_size,
+                    compatibility_type=str(compatibility_cfg.get("type", "potts")),
+                    compatibility_hidden_dim=compatibility_cfg.get("hidden_dim", None),
+                    compatibility_projection_dim=int(compatibility_cfg.get("projection_dim", 128)),
+                    compatibility_transform=str(
+                        compatibility_cfg.get("transform", "one_minus_cosine")
+                    ),
+                    compatibility_temperature=float(compatibility_cfg.get("temperature", 1.0)),
+                    compatibility_detach_slots=bool(compatibility_cfg.get("detach_slots", False)),
+                    compatibility_symmetrize=bool(compatibility_cfg.get("symmetrize", True)),
+                    compatibility_diagonal=str(compatibility_cfg.get("diagonal", "zero")),
+                    compatibility_num_layers=int(compatibility_cfg.get("num_layers", 2)),
+                    compatibility_num_heads=int(compatibility_cfg.get("num_heads", 4)),
+                    compatibility_dropout=float(compatibility_cfg.get("dropout", 0.0)),
+                    eps=float(token_crf_cfg.get("eps", eps)),
+                )
+
     @staticmethod
     def _attn_to_assignments(attn_vis: torch.Tensor, eps: float) -> torch.Tensor:
         attn = attn_vis.sum(dim=1)  # [B, N, S]
         norm = attn.sum(dim=-1, keepdim=True).clamp_min(eps)
         return attn / norm
+
+    @staticmethod
+    def _cross_attn_to_assignments(
+        attn: torch.Tensor,
+        *,
+        num_slots: int,
+        eps: float,
+    ) -> torch.Tensor:
+        slot_attn = attn[..., :num_slots].sum(dim=1)
+        norm = slot_attn.sum(dim=-1, keepdim=True).clamp_min(eps)
+        return slot_attn / norm
+
+    def _scatter_query_assignments(
+        self,
+        assignments: torch.Tensor,
+        query_indices: torch.Tensor,
+        *,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        bsz, num_queries, num_slots = assignments.shape
+        full = torch.zeros(
+            bsz,
+            num_tokens,
+            num_slots,
+            device=assignments.device,
+            dtype=assignments.dtype,
+        )
+        full.scatter_add_(1, query_indices.unsqueeze(-1).expand(-1, -1, num_slots), assignments)
+        return full
+
+    @staticmethod
+    def _gather_query_assignments(
+        assignments: torch.Tensor,
+        query_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.gather(
+            assignments,
+            1,
+            query_indices.unsqueeze(-1).expand(-1, -1, assignments.shape[-1]),
+        )
+
+    def _assignments_to_cross_attn(
+        self,
+        raw_attn: torch.Tensor,
+        assignments: torch.Tensor,
+        *,
+        num_slots: int,
+    ) -> torch.Tensor:
+        slot_mass = raw_attn[..., :num_slots].sum(dim=-1, keepdim=True)
+        slot_attn = slot_mass * assignments.unsqueeze(1)
+        if raw_attn.shape[-1] == num_slots:
+            return slot_attn
+        return torch.cat([slot_attn, raw_attn[..., num_slots:]], dim=-1)
+
+    def _slot_teacher_assignments(self, slot_info: Optional[dict]) -> Optional[torch.Tensor]:
+        if slot_info is None:
+            return None
+        stage = self.cross_token_crf_teacher_stage
+        if stage in ("raw", "before", "before_crf"):
+            return slot_info.get("raw_assignments", None)
+        if stage in ("refined", "after", "after_crf"):
+            return slot_info.get("refined_assignments", None)
+        if stage == "effective":
+            effective = slot_info.get("effective_attn_vis", None)
+            if effective is not None:
+                return self._attn_to_assignments(effective, self.eps)
+        return None
+
+    def _make_cross_attn_transform(
+        self,
+        *,
+        feats: torch.Tensor,
+        slots: torch.Tensor,
+        query_indices: torch.Tensor,
+        num_tokens: int,
+        num_slots: int,
+        slot_info: Optional[dict],
+        info: dict,
+        layer_index: int,
+    ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        teacher_enabled = self.cross_token_crf_teacher_source in (
+            "slot_attention",
+            "sa",
+            "slots",
+        )
+        crf_enabled = self.cross_token_crf is not None and self.cross_token_crf_mode != "off"
+        if not teacher_enabled and not crf_enabled:
+            return None
+        if not self.cross_token_crf_apply_all_layers and layer_index < len(self.decoder_blocks) - 1:
+            return None
+        if self.cross_token_crf is None:
+            return None
+
+        context = self.cross_token_crf.build_context(feats)
+        teacher = self._slot_teacher_assignments(slot_info) if teacher_enabled else None
+        if teacher is not None and teacher.shape[:2] != (feats.shape[0], num_tokens):
+            teacher = None
+        if teacher is not None and teacher.shape[-1] != num_slots:
+            teacher = teacher[..., :num_slots]
+            teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        if teacher is not None and self.cross_token_crf_teacher_apply_crf:
+            teacher = self.cross_token_crf.refine(
+                teacher,
+                context,
+                slot_embeddings=slots,
+            ).refined_probs
+
+        def transform(raw_attn: torch.Tensor) -> torch.Tensor:
+            raw_assign_ordered = self._cross_attn_to_assignments(
+                raw_attn,
+                num_slots=num_slots,
+                eps=self.eps,
+            )
+            raw_assign = self._scatter_query_assignments(
+                raw_assign_ordered,
+                query_indices,
+                num_tokens=num_tokens,
+            )
+            q0 = raw_assign
+            if teacher is not None:
+                if self.cross_token_crf_guided_grad_substitute:
+                    q0 = teacher.detach() + (raw_assign - raw_assign.detach())
+                else:
+                    q0 = teacher
+
+            refined = q0
+            stats = {}
+            if crf_enabled:
+                refinement = self.cross_token_crf.refine(
+                    q0,
+                    context,
+                    slot_embeddings=slots,
+                )
+                refined = refinement.refined_probs
+                stats = refinement.stats
+
+            if self.cross_token_crf_mode == "replace":
+                effective = refined
+            elif self.cross_token_crf_mode == "blend":
+                blend = min(max(self.cross_token_crf_blend, 0.0), 1.0)
+                effective = (1.0 - blend) * q0 + blend * refined
+            else:
+                effective = q0
+
+            effective_ordered = self._gather_query_assignments(effective, query_indices)
+            info["raw_assignments"] = raw_assign
+            info["refined_assignments"] = refined
+            info["effective_assignments"] = effective
+            if stats:
+                totals = info.setdefault("crf_stat_totals", {})
+                for name, value in stats.items():
+                    totals[name] = totals.get(name, 0.0) + float(value.detach().item())
+                info["crf_stat_count"] = int(info.get("crf_stat_count", 0)) + 1
+
+            if self.cross_token_crf_return_refined_attn or teacher is not None:
+                return self._assignments_to_cross_attn(
+                    raw_attn,
+                    effective_ordered,
+                    num_slots=num_slots,
+                )
+            return raw_attn
+
+        return transform
+
+    @staticmethod
+    def _finalize_cross_crf_info(info: dict) -> dict:
+        totals = info.pop("crf_stat_totals", {})
+        count = int(info.pop("crf_stat_count", 0))
+        info["crf_stats"] = {
+            name: total / count for name, total in totals.items()
+        } if count > 0 else {}
+        return info
 
     @staticmethod
     def _gather_tokens(tokens: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -611,6 +865,7 @@ class SlotMARDecoder(nn.Module):
         known_tokens: Optional[torch.Tensor] = None,
         mask_ratio: Optional[float] = None,
         mask_len: Optional[int] = None,
+        slot_info: Optional[dict] = None,
     ) -> SlotMAROutput:
         if feats.ndim != 4:
             raise ValueError(f"feats must have shape [B, C, H, W]; got {tuple(feats.shape)}")

@@ -1,0 +1,195 @@
+model:
+  type: ar
+train:
+  max_updates: 100002
+  val_every_updates: 10000
+  log_every_updates: 500
+  val_iterative: false
+  val_iterative_steps: 64
+  val_iterative_teacher_force: true
+  val_iterative_parallel: false
+  use_tqdm: true
+  seed: 39
+  deterministic: false
+  compile:
+    enabled: false
+    mode: reduce-overhead
+    fullgraph: false
+  batch_size: 64
+  val_batch_size: 32
+  gradient_accumulation_steps: 1
+  num_workers: 8
+  val_num_workers: 4
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  images_only: true
+  return_properties: false
+  max_samples_train: null
+  max_samples_val: 2000
+  max_val_batches: 20
+  grad_clip_norm: 1.0
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  lr_schedule:
+    type: cosine
+    warmup_steps: 10000
+    min_lr: 1.0e-06
+  ema:
+    enabled: false
+    rate: 0.9999
+    use_for_val: false
+  ckpt:
+    every_updates: 10000
+    keep_last: 1
+    resume_path: null
+    resume_latest: false
+  amp: true
+  amp_dtype: bfloat16
+  dino_cache:
+    enabled: false
+    dir: ./data/coco/dino_cache
+    skip_image_loading: true
+    backend: lmdb
+    lmdb_map_size_gb: 256
+data:
+  dataset: coco
+  root: ./data/coco
+  image_size: 256
+  max_objects: 60
+  train_split: train2017
+  val_split: val2017
+  min_area: 0.0
+  train_horizontal_flip_prob: 0.5
+dino:
+  version: v3
+  variant: vitb16
+  freeze: true
+  compile: false
+slots:
+  num_iterations: 5
+  num_slots: 7
+  num_heads: 1
+  slot_size: 512
+  input_size: null
+  out_size: null
+  mlp_hidden_size: 2048
+  truncate: fixed-point
+  qk_rmsnorm: false
+  qk_rmsnorm_eps: 1.0e-06
+  rope: {}
+  init_mode: gaussian
+  kmeans_iters: 10
+ar:
+  model_dim: 768
+  encoder_depth: 0
+  decoder_depth: 4
+  num_heads: 6
+  mlp_hidden_dim: 3072
+  slot_cross_mlp: false
+  dropout: 0.0
+  self_attn_type: causal
+  prediction_order: raster
+  random_order_prob_start: 1.0
+  random_order_prob_start_step: 50000
+  random_order_prob_end: 0.0
+  random_order_prob_end_step: 100000
+  buffer_size: 64
+  register_slots: 64
+  slot_conditioned: false
+  slot_conditional_depth: 2
+  slot_conditional_dropout: 0.0
+  slot_conditional_qk_norm: false
+  slot_conditional_embed: false
+  qk_norm: false
+  use_bos_token: true
+  pos_embed_type: mlp
+  max_seq_len: 256
+mask_matching:
+  enabled: false
+  loss_type: bce
+  lambda_start: 0.0
+  lambda_end: 0.05
+  coeff_by_loss:
+    bce: 1.0
+    soft_ce: 0.211340206185567
+    kl: 10.0
+  lambda_warmup_steps: 0
+  lambda_ramp_steps: 40000
+crf:
+  enabled: true
+  num_iterations: 5
+  detach_features: true
+  unary_temperature: 1.0
+  pairwise_topk: null
+  exclude_self: true
+  spatial:
+    enabled: true
+    weight: 3.0
+    sigma: 1.5
+  appearance:
+    enabled: true
+    weight: 6.0
+    sigma: 0.35
+    spatial_sigma: 2.5
+    similarity: cosine
+    normalize_features: true
+  compatibility:
+    type: potts
+  slot_attention:
+    mode: disabled
+    apply_every_iteration: false
+    ste_grad: false
+    ste_grad_scale: 1.0
+    detach_refined: false
+    detach_refined_except_final: false
+    blend: 0.5
+    return_refined_attn: true
+  guidance:
+    slot_attention:
+      enabled: false
+      loss_type: soft_ce
+      coeff: 1.0
+      lambda_start: 0.0
+      lambda_end: 0.005
+      lambda_warmup_steps: 20000
+      lambda_ramp_steps: 80000
+      target_detach: true
+      start_step: 20000
+      target_temperature: 2.0
+      pred_temperature: 1.0
+    decoder:
+      enabled: false
+      loss_type: soft_ce
+      coeff: 1.0
+      lambda_start: 0.0
+      lambda_end: 0.005
+      lambda_warmup_steps: 20000
+      lambda_ramp_steps: 80000
+      target_detach: true
+      start_step: 20000
+      target_temperature: 2.0
+      pred_temperature: 1.0
+  cross_attention:
+    mode: replace
+    apply_all_layers: true
+    blend: 0.5
+    return_refined_attn: true
+    teacher_source: none
+    teacher_stage: raw
+    teacher_apply_crf: false
+    guided_grad_substitute: true
+  cross_to_slot_guidance:
+    enabled: false
+    teacher_stage: raw
+    guided_grad_substitute: true
+wandb:
+  enabled: true
+  project: slot-crf
+  entity: null
+  run_name: crf3_03_xattn_crf_all_layers
+  mode: online
+output:
+  dir: runs
+experiment:
+  hypothesis: cross-attention CRF all layers
