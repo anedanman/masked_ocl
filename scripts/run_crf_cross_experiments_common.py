@@ -106,6 +106,7 @@ TRANSFORMER_COMPAT: Dict[str, Any] = {
     "num_layers": 2,
     "num_heads": 8,
     "dropout": 0.0,
+    "output_norm": "rms",
     "transform": "softplus_product",
     "temperature": 1.0,
     "detach_slots": False,

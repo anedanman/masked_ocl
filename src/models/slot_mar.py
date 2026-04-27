@@ -485,6 +485,7 @@ class SlotMARDecoder(nn.Module):
                     compatibility_num_layers=int(compatibility_cfg.get("num_layers", 2)),
                     compatibility_num_heads=int(compatibility_cfg.get("num_heads", 4)),
                     compatibility_dropout=float(compatibility_cfg.get("dropout", 0.0)),
+                    compatibility_output_norm=compatibility_cfg.get("output_norm", None),
                     eps=float(token_crf_cfg.get("eps", eps)),
                 )
 

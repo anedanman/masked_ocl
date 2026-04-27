@@ -51,6 +51,7 @@ class TokenFeatureCRF(nn.Module):
         compatibility_num_layers: int = 2,
         compatibility_num_heads: int = 4,
         compatibility_dropout: float = 0.0,
+        compatibility_output_norm: Optional[str] = None,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -107,6 +108,14 @@ class TokenFeatureCRF(nn.Module):
         self.compatibility_diagonal = str(compatibility_diagonal).lower()
         if self.compatibility_diagonal not in ("zero", "keep"):
             raise ValueError("compatibility_diagonal must be 'zero' or 'keep'.")
+        output_norm = compatibility_output_norm
+        if output_norm is None:
+            output_norm = "rms" if compatibility_type == "transformer_product" else "none"
+        self.compatibility_output_norm = str(output_norm).lower()
+        if self.compatibility_output_norm in ("disabled", "false"):
+            self.compatibility_output_norm = "none"
+        if self.compatibility_output_norm not in ("none", "rms", "l2"):
+            raise ValueError("compatibility_output_norm must be 'none', 'rms', or 'l2'.")
         self.slot_compat_mlp: Optional[nn.Module] = None
         self.slot_compat_transformer: Optional[nn.Module] = None
         if self.compatibility_type == "cosine_mlp":
@@ -151,6 +160,14 @@ class TokenFeatureCRF(nn.Module):
             )
         self.eps = float(eps)
         self._coord_cache: dict[tuple[int, int, str], torch.Tensor] = {}
+
+    def _normalize_compat_projection(self, projected: torch.Tensor) -> torch.Tensor:
+        if self.compatibility_output_norm == "rms":
+            rms = projected.pow(2).mean(dim=-1, keepdim=True)
+            return projected * torch.rsqrt(rms + self.eps)
+        if self.compatibility_output_norm == "l2":
+            return F.normalize(projected, dim=-1, eps=self.eps)
+        return projected
 
     def _cache_key(self, height: int, width: int, device: torch.device) -> tuple[int, int, str]:
         return height, width, str(device)
@@ -348,6 +365,7 @@ class TokenFeatureCRF(nn.Module):
             if self.slot_compat_transformer is None:
                 raise RuntimeError("slot_compat_transformer was not initialized.")
             projected = self.slot_compat_transformer(slots)
+            projected = self._normalize_compat_projection(projected)
             scale = math.sqrt(max(projected.shape[-1], 1))
             sim = torch.matmul(projected, projected.transpose(1, 2)) / scale
             if self.compatibility_symmetrize:
