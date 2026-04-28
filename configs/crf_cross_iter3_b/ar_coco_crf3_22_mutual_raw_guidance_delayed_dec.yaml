@@ -135,7 +135,14 @@ crf:
     similarity: cosine
     normalize_features: true
   compatibility:
-    type: potts
+    type: cosine_mlp
+    hidden_dim: 512
+    projection_dim: 128
+    transform: one_minus_cosine
+    temperature: 1.0
+    detach_slots: false
+    symmetrize: true
+    diagonal: zero
   slot_attention:
     mode: replace
     apply_every_iteration: true
@@ -175,7 +182,7 @@ crf:
     apply_all_layers: true
     blend: 0.5
     return_refined_attn: true
-    teacher_source: none
+    teacher_source: slot_attention
     teacher_stage: raw
     teacher_apply_crf: false
     loss_type: soft_ce
@@ -190,7 +197,7 @@ crf:
     pred_temperature: 1.0
   cross_to_slot_guidance:
     enabled: true
-    teacher_stage: refined
+    teacher_stage: raw
     loss_type: soft_ce
     coeff: 1.0
     lambda_start: 0.0
@@ -205,9 +212,10 @@ wandb:
   enabled: true
   project: slot-crf
   entity: null
-  run_name: crf3_08_xattn_refined_guides_sa_delayed_dec
+  run_name: crf3_22_mutual_raw_guidance_delayed_dec
   mode: online
 output:
   dir: runs
 experiment:
-  hypothesis: cross-attention CRF output guides SA with delayed decoder guidance
+  hypothesis: 'MLP compatibility: SA raw guides cross-attention and cross-attention
+    raw guides SA'

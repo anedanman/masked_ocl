@@ -135,7 +135,14 @@ crf:
     similarity: cosine
     normalize_features: true
   compatibility:
-    type: potts
+    type: cosine_mlp
+    hidden_dim: 512
+    projection_dim: 128
+    transform: one_minus_cosine
+    temperature: 1.0
+    detach_slots: false
+    symmetrize: true
+    diagonal: zero
   slot_attention:
     mode: replace
     apply_every_iteration: true
@@ -205,9 +212,9 @@ wandb:
   enabled: true
   project: slot-crf
   entity: null
-  run_name: crf3_10_mutual_teacher_crf_guidance_delayed_dec
+  run_name: crf3_23_mutual_teacher_crf_guidance_delayed_dec
   mode: online
 output:
   dir: runs
 experiment:
-  hypothesis: mutual guidance with CRF-refined teachers
+  hypothesis: 'MLP compatibility: mutual guidance with CRF-refined teachers'

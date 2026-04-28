@@ -144,8 +144,8 @@ crf:
     symmetrize: true
     diagonal: zero
   slot_attention:
-    mode: replace
-    apply_every_iteration: true
+    mode: disabled
+    apply_every_iteration: false
     ste_grad: false
     ste_grad_scale: 1.0
     detach_refined: false
@@ -166,15 +166,15 @@ crf:
       target_temperature: 1.0
       pred_temperature: 1.0
     decoder:
-      enabled: true
+      enabled: false
       loss_type: soft_ce
       coeff: 1.0
       lambda_start: 0.0
-      lambda_end: 0.001
-      lambda_warmup_steps: 50000
+      lambda_end: 0.005
+      lambda_warmup_steps: 20000
       lambda_ramp_steps: 80000
       target_detach: true
-      start_step: 50000
+      start_step: 20000
       target_temperature: 1.0
       pred_temperature: 1.0
   cross_attention:
@@ -196,7 +196,7 @@ crf:
     target_temperature: 1.0
     pred_temperature: 1.0
   cross_to_slot_guidance:
-    enabled: true
+    enabled: false
     teacher_stage: raw
     loss_type: soft_ce
     coeff: 1.0
@@ -212,10 +212,9 @@ wandb:
   enabled: true
   project: slot-crf
   entity: null
-  run_name: crf3_16_xattn_raw_guides_sa_delayed_dec
+  run_name: crf3_16_xattn_crf_all_layers
   mode: online
 output:
   dir: runs
 experiment:
-  hypothesis: 'MLP compatibility: cross-attention raw guides SA with delayed decoder
-    guidance'
+  hypothesis: 'MLP compatibility: cross-attention CRF all layers'

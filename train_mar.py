@@ -114,9 +114,8 @@ def _gather_gt_tokens(features: torch.Tensor, pred_indices: torch.Tensor) -> tor
     return torch.gather(gt_tokens, 1, pred_indices.unsqueeze(-1).expand(-1, -1, gt_tokens.shape[-1]))
 
 
-def _cross_teacher_to_slot_override(
+def _get_cross_assignments(
     decoder_info: Optional[dict],
-    attn_vis: torch.Tensor,
     *,
     stage: str,
 ) -> Optional[torch.Tensor]:
@@ -130,14 +129,76 @@ def _cross_teacher_to_slot_override(
         teacher = cross_info.get("refined_assignments", None)
     else:
         teacher = cross_info.get("effective_assignments", None)
-    if teacher is None:
+    return teacher
+
+
+def _get_slot_assignments(
+    slot_info: Optional[dict],
+    *,
+    stage: str,
+) -> Optional[torch.Tensor]:
+    if not slot_info:
         return None
-    if teacher.shape[0] != attn_vis.shape[0] or teacher.shape[1] != attn_vis.shape[2]:
+    stage = str(stage).lower()
+    if stage in ("raw", "before", "before_crf"):
+        return slot_info.get("raw_assignments", None)
+    if stage in ("refined", "after", "after_crf"):
+        return slot_info.get("refined_assignments", None)
+    effective = slot_info.get("effective_attn_vis", None)
+    if effective is None:
         return None
-    if teacher.shape[-1] != attn_vis.shape[-1]:
-        teacher = teacher[..., : attn_vis.shape[-1]]
-        teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-    return teacher.unsqueeze(1).expand(-1, attn_vis.shape[1], -1, -1)
+    attn = effective.sum(dim=1)
+    return attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def _match_assignment_shapes(
+    pred: Optional[torch.Tensor],
+    target: Optional[torch.Tensor],
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if pred is None or target is None:
+        return None, None
+    if pred.shape[0] != target.shape[0] or pred.shape[1] != target.shape[1]:
+        return None, None
+    if pred.shape[-1] != target.shape[-1]:
+        min_slots = min(pred.shape[-1], target.shape[-1])
+        pred = pred[..., :min_slots]
+        target = target[..., :min_slots]
+        pred = pred / pred.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    return pred, target
+
+
+def _compute_assignment_guidance_loss(
+    pred: Optional[torch.Tensor],
+    target: Optional[torch.Tensor],
+    *,
+    loss_type: str,
+    pred_temperature: float,
+    target_temperature: float,
+    target_detach: bool,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    pred, target = _match_assignment_shapes(pred, target)
+    if pred is None or target is None:
+        return None
+    target = target.detach() if target_detach else target
+    with torch.autocast(device_type=device.type, enabled=False):
+        pred = _apply_distribution_temperature(
+            pred,
+            pred_temperature,
+            normalize_dim=-1,
+        )
+        target = _apply_distribution_temperature(
+            target,
+            target_temperature,
+            normalize_dim=-1,
+        )
+        return compute_distribution_matching_loss(
+            pred,
+            target,
+            loss_type=loss_type,
+            normalize_dim=-1,
+        )
 
 
 def _linear_ramp_schedule(
@@ -434,11 +495,46 @@ def main():
     dec_guidance_start_step = int(
         dec_guidance_cfg.get("start_step", dec_guidance_cfg.get("enabled_after_step", 0))
     )
+    cross_guidance_cfg = dict(crf_cfg.get("cross_attention", {}) or {})
+    cross_teacher_source = str(cross_guidance_cfg.get("teacher_source", "none")).lower()
+    cross_guidance_enabled = crf_enabled and cross_teacher_source in ("slot_attention", "sa", "slots")
+    cross_guidance_loss_type = normalize_mask_matching_loss_type(
+        cross_guidance_cfg.get("loss_type", "soft_ce")
+    )
+    cross_guidance_coeff = _resolve_matching_coeff(cross_guidance_cfg, cross_guidance_loss_type)
+    (
+        cross_guidance_start,
+        cross_guidance_end,
+        cross_guidance_warmup_steps,
+        cross_guidance_ramp_steps,
+    ) = _resolve_scheduled_lambda(cross_guidance_cfg, default_end=0.001)
+    cross_guidance_target_detach = bool(cross_guidance_cfg.get("target_detach", True))
+    cross_guidance_target_temperature = float(cross_guidance_cfg.get("target_temperature", 3.0))
+    cross_guidance_pred_temperature = float(cross_guidance_cfg.get("pred_temperature", 1.0))
+    cross_guidance_start_step = int(
+        cross_guidance_cfg.get("start_step", cross_guidance_cfg.get("enabled_after_step", 50000))
+    )
+    cross_guidance_teacher_stage = str(cross_guidance_cfg.get("teacher_stage", "raw")).lower()
+    cross_guidance_teacher_apply_crf = bool(cross_guidance_cfg.get("teacher_apply_crf", False))
+
     cross_to_slot_cfg = dict(crf_cfg.get("cross_to_slot_guidance", {}) or {})
     cross_to_slot_enabled = crf_enabled and bool(cross_to_slot_cfg.get("enabled", False))
     cross_to_slot_stage = str(cross_to_slot_cfg.get("teacher_stage", "raw")).lower()
-    cross_to_slot_guided_grad_substitute = bool(
-        cross_to_slot_cfg.get("guided_grad_substitute", True)
+    cross_to_slot_loss_type = normalize_mask_matching_loss_type(
+        cross_to_slot_cfg.get("loss_type", "soft_ce")
+    )
+    cross_to_slot_coeff = _resolve_matching_coeff(cross_to_slot_cfg, cross_to_slot_loss_type)
+    (
+        cross_to_slot_start,
+        cross_to_slot_end,
+        cross_to_slot_warmup_steps,
+        cross_to_slot_ramp_steps,
+    ) = _resolve_scheduled_lambda(cross_to_slot_cfg, default_end=0.001)
+    cross_to_slot_target_detach = bool(cross_to_slot_cfg.get("target_detach", True))
+    cross_to_slot_target_temperature = float(cross_to_slot_cfg.get("target_temperature", 3.0))
+    cross_to_slot_pred_temperature = float(cross_to_slot_cfg.get("pred_temperature", 1.0))
+    cross_to_slot_start_step = int(
+        cross_to_slot_cfg.get("start_step", cross_to_slot_cfg.get("enabled_after_step", 50000))
     )
 
     sched_cfg = train_cfg.get("lr_schedule")
@@ -547,6 +643,10 @@ def main():
         sa_guidance_loss_count = 0
         dec_guidance_loss_total = 0.0
         dec_guidance_loss_count = 0
+        cross_guidance_loss_total = 0.0
+        cross_guidance_loss_count = 0
+        cross_to_slot_loss_total = 0.0
+        cross_to_slot_loss_count = 0
         crf_stat_totals: Dict[str, float] = {}
         crf_stat_counts: Dict[str, int] = {}
         mask_ratio_total = 0.0
@@ -591,6 +691,30 @@ def main():
             else 0.0
         )
         dec_guidance_lambda = base_dec_guidance_lambda * dec_guidance_coeff
+        base_cross_guidance_lambda = (
+            _linear_ramp_schedule(
+                global_step,
+                start=cross_guidance_start,
+                end=cross_guidance_end,
+                warmup_steps=cross_guidance_warmup_steps,
+                ramp_steps=cross_guidance_ramp_steps,
+            )
+            if cross_guidance_enabled and global_step >= cross_guidance_start_step
+            else 0.0
+        )
+        cross_guidance_lambda = base_cross_guidance_lambda * cross_guidance_coeff
+        base_cross_to_slot_lambda = (
+            _linear_ramp_schedule(
+                global_step,
+                start=cross_to_slot_start,
+                end=cross_to_slot_end,
+                warmup_steps=cross_to_slot_warmup_steps,
+                ramp_steps=cross_to_slot_ramp_steps,
+            )
+            if cross_to_slot_enabled and global_step >= cross_to_slot_start_step
+            else 0.0
+        )
+        cross_to_slot_lambda = base_cross_to_slot_lambda * cross_to_slot_coeff
 
         for _ in range(grad_accum_steps):
             try:
@@ -628,28 +752,6 @@ def main():
                     # recompilation from passing a fresh Python float into a compiled module.
                     mask_ratio = decoder._sample_mask_ratio()
                     mask_len = max(1, min(num_tokens, int(num_tokens * mask_ratio + 0.9999)))
-                    if cross_to_slot_enabled:
-                        with torch.no_grad():
-                            teacher_output = decoder(
-                                feats,
-                                slots,
-                                attn_vis,
-                                mask_len=mask_len,
-                                slot_info=slot_info,
-                            )
-                        attn_override = _cross_teacher_to_slot_override(
-                            teacher_output.info,
-                            attn_vis,
-                            stage=cross_to_slot_stage,
-                        )
-                        if attn_override is not None:
-                            slots, attn_vis, init_loss, slot_info = slot_attn(
-                                feats,
-                                cls_token=cls_token,
-                                attn_override=attn_override,
-                                guided_grad_substitute=cross_to_slot_guided_grad_substitute,
-                                return_info=True,
-                            )
                     output = decoder(feats, slots, attn_vis, mask_len=mask_len, slot_info=slot_info)
                 else:
                     if hasattr(decoder, "sample_training_order"):
@@ -664,28 +766,6 @@ def main():
                         random_order_measure_count += 1
                     else:
                         order = decoder._sample_orders(B, num_tokens, device=device)
-                    if cross_to_slot_enabled:
-                        with torch.no_grad():
-                            teacher_output = decoder(
-                                feats,
-                                slots,
-                                attn_vis,
-                                order=order,
-                                slot_info=slot_info,
-                            )
-                        attn_override = _cross_teacher_to_slot_override(
-                            teacher_output.info,
-                            attn_vis,
-                            stage=cross_to_slot_stage,
-                        )
-                        if attn_override is not None:
-                            slots, attn_vis, init_loss, slot_info = slot_attn(
-                                feats,
-                                cls_token=cls_token,
-                                attn_override=attn_override,
-                                guided_grad_substitute=cross_to_slot_guided_grad_substitute,
-                                return_info=True,
-                            )
                     output = decoder(feats, slots, attn_vis, order=order, slot_info=slot_info)
                 gt_pred = _gather_gt_tokens(feats, output.pred_indices)
                 loss = F.mse_loss(output.predictions, gt_pred)
@@ -716,6 +796,45 @@ def main():
                                 stat_value.detach().item()
                             )
                             crf_stat_counts[stat_name] = crf_stat_counts.get(stat_name, 0) + 1
+
+                if cross_guidance_enabled and global_step >= cross_guidance_start_step:
+                    cross_student = _get_cross_assignments(output_info, stage="raw")
+                    slot_teacher_stage = (
+                        "refined" if cross_guidance_teacher_apply_crf else cross_guidance_teacher_stage
+                    )
+                    slot_teacher = _get_slot_assignments(slot_info, stage=slot_teacher_stage)
+                    cross_guidance_loss = _compute_assignment_guidance_loss(
+                        cross_student,
+                        slot_teacher,
+                        loss_type=cross_guidance_loss_type,
+                        pred_temperature=cross_guidance_pred_temperature,
+                        target_temperature=cross_guidance_target_temperature,
+                        target_detach=cross_guidance_target_detach,
+                        device=device,
+                    )
+                    if cross_guidance_loss is not None:
+                        cross_guidance_loss_total += float(cross_guidance_loss.detach().item())
+                        cross_guidance_loss_count += 1
+                        if cross_guidance_lambda != 0.0:
+                            loss = loss + cross_guidance_lambda * cross_guidance_loss
+
+                if cross_to_slot_enabled and global_step >= cross_to_slot_start_step:
+                    slot_student = raw_slot_assignments
+                    cross_teacher = _get_cross_assignments(output_info, stage=cross_to_slot_stage)
+                    cross_to_slot_loss = _compute_assignment_guidance_loss(
+                        slot_student,
+                        cross_teacher,
+                        loss_type=cross_to_slot_loss_type,
+                        pred_temperature=cross_to_slot_pred_temperature,
+                        target_temperature=cross_to_slot_target_temperature,
+                        target_detach=cross_to_slot_target_detach,
+                        device=device,
+                    )
+                    if cross_to_slot_loss is not None:
+                        cross_to_slot_loss_total += float(cross_to_slot_loss.detach().item())
+                        cross_to_slot_loss_count += 1
+                        if cross_to_slot_lambda != 0.0:
+                            loss = loss + cross_to_slot_lambda * cross_to_slot_loss
 
                 if mask_match_enabled and dec_masks is not None:
                     sa_masks = attn_to_slot_masks(attn_vis, Hf, Wf)
@@ -861,6 +980,16 @@ def main():
             if dec_guidance_loss_count > 0
             else None
         )
+        avg_cross_guidance_loss = (
+            cross_guidance_loss_total / cross_guidance_loss_count
+            if cross_guidance_loss_count > 0
+            else None
+        )
+        avg_cross_to_slot_loss = (
+            cross_to_slot_loss_total / cross_to_slot_loss_count
+            if cross_to_slot_loss_count > 0
+            else None
+        )
         avg_crf_stats = (
             {
                 name: total / max(crf_stat_counts.get(name, 1), 1)
@@ -903,6 +1032,18 @@ def main():
                 log_dict["train/crf_decoder_guidance_lambda"] = dec_guidance_lambda
                 if avg_dec_guidance_loss is not None:
                     log_dict["train/crf_decoder_guidance_loss"] = avg_dec_guidance_loss
+            if cross_guidance_enabled:
+                log_dict["train/crf_cross_guidance_coeff"] = cross_guidance_coeff
+                log_dict["train/crf_cross_guidance_lambda_base"] = base_cross_guidance_lambda
+                log_dict["train/crf_cross_guidance_lambda"] = cross_guidance_lambda
+                if avg_cross_guidance_loss is not None:
+                    log_dict["train/crf_cross_guidance_loss"] = avg_cross_guidance_loss
+            if cross_to_slot_enabled:
+                log_dict["train/crf_cross_to_slot_guidance_coeff"] = cross_to_slot_coeff
+                log_dict["train/crf_cross_to_slot_guidance_lambda_base"] = base_cross_to_slot_lambda
+                log_dict["train/crf_cross_to_slot_guidance_lambda"] = cross_to_slot_lambda
+                if avg_cross_to_slot_loss is not None:
+                    log_dict["train/crf_cross_to_slot_guidance_loss"] = avg_cross_to_slot_loss
             if grad_norm is not None:
                 log_dict["train/grad_norm"] = grad_norm
 
@@ -963,6 +1104,18 @@ def main():
                 log_dict["train/crf_decoder_guidance_lambda"] = dec_guidance_lambda
                 if avg_dec_guidance_loss is not None:
                     log_dict["train/crf_decoder_guidance_loss"] = avg_dec_guidance_loss
+            if cross_guidance_enabled:
+                log_dict["train/crf_cross_guidance_coeff"] = cross_guidance_coeff
+                log_dict["train/crf_cross_guidance_lambda_base"] = base_cross_guidance_lambda
+                log_dict["train/crf_cross_guidance_lambda"] = cross_guidance_lambda
+                if avg_cross_guidance_loss is not None:
+                    log_dict["train/crf_cross_guidance_loss"] = avg_cross_guidance_loss
+            if cross_to_slot_enabled:
+                log_dict["train/crf_cross_to_slot_guidance_coeff"] = cross_to_slot_coeff
+                log_dict["train/crf_cross_to_slot_guidance_lambda_base"] = base_cross_to_slot_lambda
+                log_dict["train/crf_cross_to_slot_guidance_lambda"] = cross_to_slot_lambda
+                if avg_cross_to_slot_loss is not None:
+                    log_dict["train/crf_cross_to_slot_guidance_loss"] = avg_cross_to_slot_loss
             if grad_norm is not None:
                 log_dict["train/grad_norm"] = grad_norm
             wandb.log(log_dict, step=global_step)
@@ -1006,6 +1159,8 @@ def main():
                 val_losses: List[float] = []
                 val_sa_guidance_losses: List[float] = []
                 val_dec_guidance_losses: List[float] = []
+                val_cross_guidance_losses: List[float] = []
+                val_cross_to_slot_losses: List[float] = []
                 val_crf_stat_totals: Dict[str, float] = {}
                 val_crf_stat_counts: Dict[str, int] = {}
                 viz_grids: List[torch.Tensor] = []
@@ -1042,26 +1197,6 @@ def main():
                             )
                         else:
                             slots, attn_vis, _ = slot_attn(feats, cls_token=cls_token)
-                        if cross_to_slot_enabled:
-                            teacher_output = decoder(
-                                feats,
-                                slots,
-                                attn_vis,
-                                slot_info=slot_info,
-                            )
-                            attn_override = _cross_teacher_to_slot_override(
-                                teacher_output.info,
-                                attn_vis,
-                                stage=cross_to_slot_stage,
-                            )
-                            if attn_override is not None:
-                                slots, attn_vis, _, slot_info = slot_attn(
-                                    feats,
-                                    cls_token=cls_token,
-                                    attn_override=attn_override,
-                                    guided_grad_substitute=cross_to_slot_guided_grad_substitute,
-                                    return_info=True,
-                                )
                         if val_iterative:
                             iterative_steps = val_iterative_steps
                             if model_type == "ar" and not val_iterative_teacher_force:
@@ -1107,6 +1242,46 @@ def main():
                                     stat_value.detach().item()
                                 )
                                 val_crf_stat_counts[stat_name] = val_crf_stat_counts.get(stat_name, 0) + 1
+
+                        if (
+                            not val_iterative
+                            and cross_guidance_enabled
+                            and global_step >= cross_guidance_start_step
+                        ):
+                            cross_student = _get_cross_assignments(output_info, stage="raw")
+                            slot_teacher_stage = (
+                                "refined" if cross_guidance_teacher_apply_crf else cross_guidance_teacher_stage
+                            )
+                            slot_teacher = _get_slot_assignments(slot_info, stage=slot_teacher_stage)
+                            cross_loss_val = _compute_assignment_guidance_loss(
+                                cross_student,
+                                slot_teacher,
+                                loss_type=cross_guidance_loss_type,
+                                pred_temperature=cross_guidance_pred_temperature,
+                                target_temperature=cross_guidance_target_temperature,
+                                target_detach=cross_guidance_target_detach,
+                                device=device,
+                            )
+                            if cross_loss_val is not None:
+                                val_cross_guidance_losses.append(float(cross_loss_val.item()))
+
+                        if (
+                            not val_iterative
+                            and cross_to_slot_enabled
+                            and global_step >= cross_to_slot_start_step
+                        ):
+                            cross_teacher = _get_cross_assignments(output_info, stage=cross_to_slot_stage)
+                            cross_to_slot_loss_val = _compute_assignment_guidance_loss(
+                                raw_slot_assignments,
+                                cross_teacher,
+                                loss_type=cross_to_slot_loss_type,
+                                pred_temperature=cross_to_slot_pred_temperature,
+                                target_temperature=cross_to_slot_target_temperature,
+                                target_detach=cross_to_slot_target_detach,
+                                device=device,
+                            )
+                            if cross_to_slot_loss_val is not None:
+                                val_cross_to_slot_losses.append(float(cross_to_slot_loss_val.item()))
 
                         if (
                             sa_guidance_enabled
@@ -1213,6 +1388,14 @@ def main():
                 if val_dec_guidance_losses:
                     results["val/crf_decoder_guidance_loss"] = float(
                         sum(val_dec_guidance_losses) / len(val_dec_guidance_losses)
+                    )
+                if val_cross_guidance_losses:
+                    results["val/crf_cross_guidance_loss"] = float(
+                        sum(val_cross_guidance_losses) / len(val_cross_guidance_losses)
+                    )
+                if val_cross_to_slot_losses:
+                    results["val/crf_cross_to_slot_guidance_loss"] = float(
+                        sum(val_cross_to_slot_losses) / len(val_cross_to_slot_losses)
                     )
                 if val_crf_stat_totals:
                     for stat_name, total in val_crf_stat_totals.items():
