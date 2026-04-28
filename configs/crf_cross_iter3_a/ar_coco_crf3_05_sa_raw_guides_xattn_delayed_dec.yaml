@@ -159,23 +159,23 @@ crf:
       target_temperature: 1.0
       pred_temperature: 1.0
     decoder:
-      enabled: false
+      enabled: true
       loss_type: soft_ce
       coeff: 1.0
       lambda_start: 0.0
-      lambda_end: 0.005
-      lambda_warmup_steps: 20000
+      lambda_end: 0.001
+      lambda_warmup_steps: 50000
       lambda_ramp_steps: 80000
       target_detach: true
-      start_step: 20000
+      start_step: 50000
       target_temperature: 1.0
       pred_temperature: 1.0
   cross_attention:
-    mode: disabled
+    mode: replace
     apply_all_layers: true
     blend: 0.5
     return_refined_attn: true
-    teacher_source: none
+    teacher_source: slot_attention
     teacher_stage: raw
     teacher_apply_crf: false
     loss_type: soft_ce
@@ -205,9 +205,9 @@ wandb:
   enabled: true
   project: slot-crf
   entity: null
-  run_name: crf3_05_sa_crf_all_iters
+  run_name: crf3_05_sa_raw_guides_xattn_delayed_dec
   mode: online
 output:
   dir: runs
 experiment:
-  hypothesis: SA CRF all iterations
+  hypothesis: SA raw guides cross-attention with delayed decoder guidance

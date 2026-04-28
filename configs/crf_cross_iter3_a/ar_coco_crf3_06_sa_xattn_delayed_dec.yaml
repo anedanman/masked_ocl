@@ -135,14 +135,7 @@ crf:
     similarity: cosine
     normalize_features: true
   compatibility:
-    type: cosine_mlp
-    hidden_dim: 512
-    projection_dim: 128
-    transform: one_minus_cosine
-    temperature: 1.0
-    detach_slots: false
-    symmetrize: true
-    diagonal: zero
+    type: potts
   slot_attention:
     mode: replace
     apply_every_iteration: true
@@ -212,10 +205,9 @@ wandb:
   enabled: true
   project: slot-crf
   entity: null
-  run_name: crf3_19_sa_xattn_delayed_dec
+  run_name: crf3_06_sa_xattn_delayed_dec
   mode: online
 output:
   dir: runs
 experiment:
-  hypothesis: 'MLP compatibility: SA and cross-attention CRF with delayed decoder
-    guidance'
+  hypothesis: SA and cross-attention CRF with delayed decoder guidance

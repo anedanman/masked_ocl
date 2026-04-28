@@ -189,7 +189,7 @@ crf:
     target_temperature: 1.0
     pred_temperature: 1.0
   cross_to_slot_guidance:
-    enabled: false
+    enabled: true
     teacher_stage: raw
     loss_type: soft_ce
     coeff: 1.0
@@ -205,9 +205,9 @@ wandb:
   enabled: true
   project: slot-crf
   entity: null
-  run_name: crf3_08_sa_raw_guides_xattn_delayed_dec
+  run_name: crf3_09_mutual_raw_guidance_delayed_dec
   mode: online
 output:
   dir: runs
 experiment:
-  hypothesis: SA raw guides cross-attention with delayed decoder guidance
+  hypothesis: SA raw guides cross-attention and cross-attention raw guides SA
