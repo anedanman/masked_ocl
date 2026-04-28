@@ -416,10 +416,6 @@ class SlotMARDecoder(nn.Module):
         self.cross_token_crf_apply_all_layers = True
         self.cross_token_crf_return_refined_attn = True
         self.cross_token_crf_blend = 0.5
-        self.cross_token_crf_teacher_source = "none"
-        self.cross_token_crf_teacher_stage = "raw"
-        self.cross_token_crf_teacher_apply_crf = False
-        self.cross_token_crf_guided_grad_substitute = True
 
         token_crf_cfg = dict(token_crf_cfg or {})
         if bool(token_crf_cfg.get("enabled", False)):
@@ -436,17 +432,7 @@ class SlotMARDecoder(nn.Module):
                 cross_cfg.get("return_refined_attn", True)
             )
             self.cross_token_crf_blend = float(cross_cfg.get("blend", 0.5))
-            self.cross_token_crf_teacher_source = str(cross_cfg.get("teacher_source", "none")).lower()
-            self.cross_token_crf_teacher_stage = str(cross_cfg.get("teacher_stage", "raw")).lower()
-            self.cross_token_crf_teacher_apply_crf = bool(cross_cfg.get("teacher_apply_crf", False))
-            self.cross_token_crf_guided_grad_substitute = bool(
-                cross_cfg.get("guided_grad_substitute", True)
-            )
-            if self.cross_token_crf_mode != "off" or self.cross_token_crf_teacher_source not in (
-                "none",
-                "disabled",
-                "off",
-            ):
+            if self.cross_token_crf_mode != "off":
                 spatial_cfg = dict(token_crf_cfg.get("spatial", {}) or {})
                 appearance_cfg = dict(token_crf_cfg.get("appearance", {}) or {})
                 compatibility_cfg = dict(token_crf_cfg.get("compatibility", {}) or {})
@@ -548,20 +534,6 @@ class SlotMARDecoder(nn.Module):
             return slot_attn
         return torch.cat([slot_attn, raw_attn[..., num_slots:]], dim=-1)
 
-    def _slot_teacher_assignments(self, slot_info: Optional[dict]) -> Optional[torch.Tensor]:
-        if slot_info is None:
-            return None
-        stage = self.cross_token_crf_teacher_stage
-        if stage in ("raw", "before", "before_crf"):
-            return slot_info.get("raw_assignments", None)
-        if stage in ("refined", "after", "after_crf"):
-            return slot_info.get("refined_assignments", None)
-        if stage == "effective":
-            effective = slot_info.get("effective_attn_vis", None)
-            if effective is not None:
-                return self._attn_to_assignments(effective, self.eps)
-        return None
-
     def _make_cross_attn_transform(
         self,
         *,
@@ -574,13 +546,8 @@ class SlotMARDecoder(nn.Module):
         info: dict,
         layer_index: int,
     ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
-        teacher_enabled = self.cross_token_crf_teacher_source in (
-            "slot_attention",
-            "sa",
-            "slots",
-        )
         crf_enabled = self.cross_token_crf is not None and self.cross_token_crf_mode != "off"
-        if not teacher_enabled and not crf_enabled:
+        if not crf_enabled:
             return None
         if not self.cross_token_crf_apply_all_layers and layer_index < len(self.decoder_blocks) - 1:
             return None
@@ -588,18 +555,6 @@ class SlotMARDecoder(nn.Module):
             return None
 
         context = self.cross_token_crf.build_context(feats)
-        teacher = self._slot_teacher_assignments(slot_info) if teacher_enabled else None
-        if teacher is not None and teacher.shape[:2] != (feats.shape[0], num_tokens):
-            teacher = None
-        if teacher is not None and teacher.shape[-1] != num_slots:
-            teacher = teacher[..., :num_slots]
-            teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        if teacher is not None and self.cross_token_crf_teacher_apply_crf:
-            teacher = self.cross_token_crf.refine(
-                teacher,
-                context,
-                slot_embeddings=slots,
-            ).refined_probs
 
         def transform(raw_attn: torch.Tensor) -> torch.Tensor:
             raw_assign_ordered = self._cross_attn_to_assignments(
@@ -613,11 +568,6 @@ class SlotMARDecoder(nn.Module):
                 num_tokens=num_tokens,
             )
             q0 = raw_assign
-            if teacher is not None:
-                if self.cross_token_crf_guided_grad_substitute:
-                    q0 = teacher.detach() + (raw_assign - raw_assign.detach())
-                else:
-                    q0 = teacher
 
             refined = q0
             stats = {}
@@ -648,7 +598,7 @@ class SlotMARDecoder(nn.Module):
                     totals[name] = totals.get(name, 0.0) + float(value.detach().item())
                 info["crf_stat_count"] = int(info.get("crf_stat_count", 0)) + 1
 
-            if self.cross_token_crf_return_refined_attn or teacher is not None:
+            if self.cross_token_crf_return_refined_attn:
                 return self._assignments_to_cross_attn(
                     raw_attn,
                     effective_ordered,

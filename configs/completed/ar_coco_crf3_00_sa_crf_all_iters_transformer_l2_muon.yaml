@@ -29,7 +29,7 @@ train:
   max_samples_val: 2000
   max_val_batches: 20
   grad_clip_norm: 1.0
-  learning_rate: 0.0003
+  learning_rate: 0.002
   weight_decay: 0.0001
   lr_schedule:
     type: cosine
@@ -135,10 +135,14 @@ crf:
     similarity: cosine
     normalize_features: true
   compatibility:
-    type: cosine_mlp
+    type: transformer_product
     hidden_dim: 512
     projection_dim: 128
-    transform: one_minus_cosine
+    num_layers: 4
+    num_heads: 8
+    dropout: 0.0
+    output_norm: l2
+    transform: softplus_product
     temperature: 1.0
     detach_slots: false
     symmetrize: true
@@ -163,7 +167,7 @@ crf:
       lambda_ramp_steps: 80000
       target_detach: true
       start_step: 20000
-      target_temperature: 2.0
+      target_temperature: 1.0
       pred_temperature: 1.0
     decoder:
       enabled: false
@@ -175,28 +179,48 @@ crf:
       lambda_ramp_steps: 80000
       target_detach: true
       start_step: 20000
-      target_temperature: 2.0
+      target_temperature: 1.0
       pred_temperature: 1.0
   cross_attention:
-    mode: replace
+    mode: disabled
     apply_all_layers: true
     blend: 0.5
     return_refined_attn: true
     teacher_source: none
     teacher_stage: raw
     teacher_apply_crf: false
-    guided_grad_substitute: true
+    loss_type: soft_ce
+    coeff: 1.0
+    lambda_start: 0.0
+    lambda_end: 0.001
+    lambda_warmup_steps: 50000
+    lambda_ramp_steps: 80000
+    start_step: 50000
+    target_detach: true
+    target_temperature: 1.0
+    pred_temperature: 1.0
   cross_to_slot_guidance:
     enabled: false
     teacher_stage: raw
-    guided_grad_substitute: true
+    loss_type: soft_ce
+    coeff: 1.0
+    lambda_start: 0.0
+    lambda_end: 0.001
+    lambda_warmup_steps: 50000
+    lambda_ramp_steps: 80000
+    start_step: 50000
+    target_detach: true
+    target_temperature: 1.0
+    pred_temperature: 1.0
 wandb:
   enabled: true
   project: slot-crf
   entity: null
-  run_name: crf3_13_sa_xattn_crf
+  run_name: crf3_00_sa_crf_all_iters_transformer_l2_muon
   mode: online
 output:
   dir: runs
+optimizer:
+  name: muon
 experiment:
-  hypothesis: 'MLP compatibility: SA and cross-attention CRF'
+  hypothesis: transformer L2 compatibility SA CRF all iterations with Muon

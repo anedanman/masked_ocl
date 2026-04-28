@@ -135,10 +135,17 @@ crf:
     similarity: cosine
     normalize_features: true
   compatibility:
-    type: potts
+    type: cosine_mlp
+    hidden_dim: 512
+    projection_dim: 128
+    transform: one_minus_cosine
+    temperature: 1.0
+    detach_slots: false
+    symmetrize: true
+    diagonal: zero
   slot_attention:
-    mode: disabled
-    apply_every_iteration: false
+    mode: replace
+    apply_every_iteration: true
     ste_grad: false
     ste_grad_scale: 1.0
     detach_refined: false
@@ -156,7 +163,7 @@ crf:
       lambda_ramp_steps: 80000
       target_detach: true
       start_step: 20000
-      target_temperature: 2.0
+      target_temperature: 1.0
       pred_temperature: 1.0
     decoder:
       enabled: false
@@ -168,7 +175,7 @@ crf:
       lambda_ramp_steps: 80000
       target_detach: true
       start_step: 20000
-      target_temperature: 2.0
+      target_temperature: 1.0
       pred_temperature: 1.0
   cross_attention:
     mode: replace
@@ -178,18 +185,36 @@ crf:
     teacher_source: none
     teacher_stage: raw
     teacher_apply_crf: false
-    guided_grad_substitute: true
+    loss_type: soft_ce
+    coeff: 1.0
+    lambda_start: 0.0
+    lambda_end: 0.001
+    lambda_warmup_steps: 50000
+    lambda_ramp_steps: 80000
+    start_step: 50000
+    target_detach: true
+    target_temperature: 1.0
+    pred_temperature: 1.0
   cross_to_slot_guidance:
     enabled: false
     teacher_stage: raw
-    guided_grad_substitute: true
+    loss_type: soft_ce
+    coeff: 1.0
+    lambda_start: 0.0
+    lambda_end: 0.001
+    lambda_warmup_steps: 50000
+    lambda_ramp_steps: 80000
+    start_step: 50000
+    target_detach: true
+    target_temperature: 1.0
+    pred_temperature: 1.0
 wandb:
   enabled: true
   project: slot-crf
   entity: null
-  run_name: crf3_03_xattn_crf_all_layers
+  run_name: crf3_13_sa_xattn_crf
   mode: online
 output:
   dir: runs
 experiment:
-  hypothesis: cross-attention CRF all layers
+  hypothesis: 'MLP compatibility: SA and cross-attention CRF'

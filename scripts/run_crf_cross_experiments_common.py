@@ -32,7 +32,7 @@ def make_guidance(
     lambda_warmup_steps: int = 20000,
     lambda_ramp_steps: int = 80000,
     start_step: int = 20000,
-    target_temperature: float = 2.0,
+    target_temperature: float = 1.0,
     pred_temperature: float = 1.0,
 ) -> dict:
     return {
@@ -85,12 +85,30 @@ BASE_CRF: Dict[str, Any] = {
         "teacher_source": "none",
         "teacher_stage": "raw",
         "teacher_apply_crf": False,
-        "guided_grad_substitute": True,
+        "loss_type": "soft_ce",
+        "coeff": 1.0,
+        "lambda_start": 0.0,
+        "lambda_end": 0.001,
+        "lambda_warmup_steps": 50000,
+        "lambda_ramp_steps": 80000,
+        "start_step": 50000,
+        "target_detach": True,
+        "target_temperature": 1.0,
+        "pred_temperature": 1.0,
     },
     "cross_to_slot_guidance": {
         "enabled": False,
         "teacher_stage": "raw",
-        "guided_grad_substitute": True,
+        "loss_type": "soft_ce",
+        "coeff": 1.0,
+        "lambda_start": 0.0,
+        "lambda_end": 0.001,
+        "lambda_warmup_steps": 50000,
+        "lambda_ramp_steps": 80000,
+        "start_step": 50000,
+        "target_detach": True,
+        "target_temperature": 1.0,
+        "pred_temperature": 1.0,
     },
     "guidance": {
         "slot_attention": make_guidance(False),
@@ -142,7 +160,7 @@ def delayed_decoder_guidance() -> dict:
                 lambda_end=0.001,
                 start_step=50000,
                 lambda_warmup_steps=50000,
-                target_temperature=3.0,
+                target_temperature=1.0,
             )
         }
     }
@@ -162,7 +180,6 @@ def sa_raw_guides_xattn(*, teacher_apply_crf: bool = False) -> dict:
             "teacher_source": "slot_attention",
             "teacher_stage": "raw",
             "teacher_apply_crf": bool(teacher_apply_crf),
-            "guided_grad_substitute": True,
         }
     }
 
@@ -172,7 +189,6 @@ def xattn_guides_sa(stage: str) -> dict:
         "cross_to_slot_guidance": {
             "enabled": True,
             "teacher_stage": stage,
-            "guided_grad_substitute": True,
         }
     }
 
