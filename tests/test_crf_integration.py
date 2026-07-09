@@ -136,6 +136,46 @@ def test_slot_attention_returns_crf_info_when_enabled() -> None:
     )
 
 
+def test_slot_attention_transformer_update_modes() -> None:
+    update_modes = [
+        "transformer_pair_slotwise",
+        "transformer_pair_global",
+        "transformer_temporal_slotwise",
+        "transformer_temporal_global",
+    ]
+    feats = torch.randn(2, 8, 4, 4)
+    for mode in update_modes:
+        slot_attn = MultiHeadSTEVESA(
+            num_iterations=3,
+            num_slots=4,
+            num_heads=1,
+            input_size=8,
+            out_size=8,
+            slot_size=8,
+            mlp_hidden_size=16,
+            update_cfg={
+                "type": mode,
+                "num_layers": 1,
+                "num_heads": 2,
+                "mlp_hidden_size": 16,
+                "dropout": 0.0,
+            },
+        )
+
+        slots, attn_vis, init_loss = slot_attn(feats)
+
+        assert slots.shape == (2, 4, 8)
+        assert attn_vis.shape == (2, 1, 16, 4)
+        assert init_loss is None
+        assert torch.isfinite(slots).all()
+        assert torch.allclose(
+            attn_vis.sum(dim=(1, 3)),
+            torch.ones_like(attn_vis[:, 0, :, 0]),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
 def test_slot_ar_decoder_can_apply_cross_attention_crf() -> None:
     decoder = SlotARDecoder(
         slot_size=16,

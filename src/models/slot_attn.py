@@ -106,6 +106,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                  epsilon=1e-8, truncate='none',
                  qk_rmsnorm=False, qk_rmsnorm_eps=1e-6,
                  init_mode='gaussian', kmeans_iters=10,
+                 update_cfg=None,
                  token_crf_cfg=None):
         super().__init__()
 
@@ -170,11 +171,118 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         self.project_v = nn.Linear(input_size, slot_size, bias=False)
 
         # slot update functions.
+        update_cfg = dict(update_cfg or {})
+        update_mode = str(update_cfg.get("type", update_cfg.get("mode", "gru"))).lower()
+        update_mode = {
+            "rnn": "gru",
+            "pair": "transformer_pair_slotwise",
+            "pair_slotwise": "transformer_pair_slotwise",
+            "slotwise_pair": "transformer_pair_slotwise",
+            "transformer_pair": "transformer_pair_slotwise",
+            "pair_global": "transformer_pair_global",
+            "global_pair": "transformer_pair_global",
+            "temporal": "transformer_temporal_slotwise",
+            "temporal_slotwise": "transformer_temporal_slotwise",
+            "slotwise_temporal": "transformer_temporal_slotwise",
+            "temporal_global": "transformer_temporal_global",
+            "global_temporal": "transformer_temporal_global",
+        }.get(update_mode, update_mode)
+        valid_update_modes = {
+            "gru",
+            "transformer_pair_slotwise",
+            "transformer_pair_global",
+            "transformer_temporal_slotwise",
+            "transformer_temporal_global",
+        }
+        if update_mode not in valid_update_modes:
+            raise ValueError(
+                f"slots.update.type must be one of {sorted(valid_update_modes)}, got '{update_mode}'"
+            )
+        self.slot_update_mode = update_mode
+        self.slot_update_post_mlp = bool(update_cfg.get("post_mlp", True))
+
         self.gru = nn.GRUCell(slot_size, slot_size)
         self.mlp = nn.Sequential(
             nn.Linear(slot_size, mlp_hidden_size),
             nn.GELU(),
             nn.Linear(mlp_hidden_size, slot_size))
+
+        self.slot_update_transformer = None
+        self.slot_update_norm_state = None
+        self.slot_update_norm_update = None
+        self.slot_update_out_norm = None
+        self.slot_update_out = None
+        self.slot_update_role_embed = None
+        self.slot_update_slot_embed = None
+        self.slot_update_iter_embed = None
+        self.slot_update_residual = True
+        self.slot_update_residual_scale = 1.0
+        self.slot_update_max_positions = int(num_iterations) + 1
+
+        if self.slot_update_mode != "gru":
+            update_heads = int(update_cfg.get("num_heads", 4))
+            if slot_size % update_heads != 0:
+                raise ValueError(
+                    f"slots.update.num_heads={update_heads} must divide slot_size={slot_size}."
+                )
+            update_layers = int(update_cfg.get("num_layers", 1))
+            update_hidden = int(update_cfg.get("mlp_hidden_size", mlp_hidden_size))
+            update_dropout = float(update_cfg.get("dropout", 0.0))
+            update_activation = str(update_cfg.get("activation", "gelu"))
+            update_norm_first = bool(update_cfg.get("norm_first", True))
+            self.slot_update_residual = bool(update_cfg.get("residual", True))
+            self.slot_update_residual_scale = float(update_cfg.get("residual_scale", 1.0))
+            self.slot_update_max_positions = int(
+                update_cfg.get("max_iterations", num_iterations)
+            ) + 1
+            if self.slot_update_max_positions < int(num_iterations) + 1:
+                raise ValueError(
+                    "slots.update.max_iterations must be at least slots.num_iterations."
+                )
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=slot_size,
+                nhead=update_heads,
+                dim_feedforward=update_hidden,
+                dropout=update_dropout,
+                activation=update_activation,
+                batch_first=True,
+                norm_first=update_norm_first,
+            )
+            try:
+                self.slot_update_transformer = nn.TransformerEncoder(
+                    encoder_layer,
+                    num_layers=update_layers,
+                    enable_nested_tensor=False,
+                )
+            except TypeError:
+                self.slot_update_transformer = nn.TransformerEncoder(
+                    encoder_layer,
+                    num_layers=update_layers,
+                )
+            self.slot_update_norm_state = nn.LayerNorm(slot_size)
+            self.slot_update_norm_update = nn.LayerNorm(slot_size)
+            self.slot_update_out_norm = nn.LayerNorm(slot_size)
+            self.slot_update_out = nn.Linear(slot_size, slot_size)
+            self.slot_update_role_embed = nn.Parameter(torch.zeros(1, 2, slot_size))
+            if self.slot_update_mode in (
+                "transformer_pair_global",
+                "transformer_temporal_global",
+            ):
+                self.slot_update_slot_embed = nn.Parameter(
+                    torch.zeros(1, num_slots, slot_size)
+                )
+            if self.slot_update_mode in (
+                "transformer_temporal_slotwise",
+                "transformer_temporal_global",
+            ):
+                self.slot_update_iter_embed = nn.Parameter(
+                    torch.zeros(1, self.slot_update_max_positions, slot_size)
+                )
+            nn.init.trunc_normal_(self.slot_update_role_embed, std=0.02)
+            if self.slot_update_slot_embed is not None:
+                nn.init.trunc_normal_(self.slot_update_slot_embed, std=0.02)
+            if self.slot_update_iter_embed is not None:
+                nn.init.trunc_normal_(self.slot_update_iter_embed, std=0.02)
         
         self.out_layer_norm = nn.LayerNorm(slot_size)
         self.out_linear = nn.Linear(slot_size, out_size)
@@ -266,6 +374,212 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             return tensor
         rms = tensor.pow(2).mean(dim=-1, keepdim=True)
         return tensor * torch.rsqrt(rms + self.qk_rmsnorm_eps)
+
+    @property
+    def _uses_temporal_slot_update(self) -> bool:
+        return self.slot_update_mode in (
+            "transformer_temporal_slotwise",
+            "transformer_temporal_global",
+        )
+
+    def _check_update_positions(self, required_positions: int) -> None:
+        if required_positions > self.slot_update_max_positions:
+            raise ValueError(
+                "Temporal slot update needs "
+                f"{required_positions} iteration positions, but slots.update.max_iterations "
+                f"allows only {self.slot_update_max_positions - 1} updates."
+            )
+
+    def _truncate_slot_history(
+        self,
+        slot_history: Optional[list[torch.Tensor]],
+        slots_init: torch.Tensor,
+    ) -> Optional[list[torch.Tensor]]:
+        if slot_history is None:
+            return None
+        if self.truncate == "fixed-point":
+            return [slots.detach() for slots in slot_history]
+        if self.truncate == "bi-level":
+            detached_history = [slots.detach() for slots in slot_history]
+            if detached_history:
+                detached_history[0] = detached_history[0] + slots_init - slots_init.detach()
+            return detached_history
+        return slot_history
+
+    def _finalize_transformer_slot_update(
+        self,
+        slots_prev: torch.Tensor,
+        transformer_output: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.slot_update_out_norm is not None
+        assert self.slot_update_out is not None
+        transformed = self.slot_update_out(
+            self.slot_update_out_norm(transformer_output)
+        )
+        if self.slot_update_residual:
+            return slots_prev + self.slot_update_residual_scale * transformed
+        return transformed
+
+    def _slot_update_pair_slotwise(
+        self,
+        slots_prev: torch.Tensor,
+        updates: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.slot_update_transformer is not None
+        assert self.slot_update_norm_state is not None
+        assert self.slot_update_norm_update is not None
+        assert self.slot_update_role_embed is not None
+
+        bsz, num_slots, slot_size = slots_prev.shape
+        state_tokens = self.slot_update_norm_state(slots_prev)
+        update_tokens = self.slot_update_norm_update(updates)
+        tokens = torch.stack((state_tokens, update_tokens), dim=2)
+        tokens = tokens + self.slot_update_role_embed.view(1, 1, 2, slot_size)
+        encoded = self.slot_update_transformer(tokens.reshape(bsz * num_slots, 2, slot_size))
+        next_state = encoded[:, 0].view(bsz, num_slots, slot_size)
+        return self._finalize_transformer_slot_update(slots_prev, next_state)
+
+    def _slot_update_pair_global(
+        self,
+        slots_prev: torch.Tensor,
+        updates: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.slot_update_transformer is not None
+        assert self.slot_update_norm_state is not None
+        assert self.slot_update_norm_update is not None
+        assert self.slot_update_role_embed is not None
+        assert self.slot_update_slot_embed is not None
+
+        bsz, num_slots, slot_size = slots_prev.shape
+        slot_pos = self.slot_update_slot_embed[:, :num_slots]
+        state_tokens = (
+            self.slot_update_norm_state(slots_prev)
+            + slot_pos
+            + self.slot_update_role_embed[:, :1]
+        )
+        update_tokens = (
+            self.slot_update_norm_update(updates)
+            + slot_pos
+            + self.slot_update_role_embed[:, 1:2]
+        )
+        tokens = torch.cat((state_tokens, update_tokens), dim=1)
+        encoded = self.slot_update_transformer(tokens)
+        next_state = encoded[:, :num_slots]
+        return self._finalize_transformer_slot_update(slots_prev, next_state)
+
+    def _slot_update_temporal_slotwise(
+        self,
+        slots_prev: torch.Tensor,
+        updates: torch.Tensor,
+        *,
+        slot_history: list[torch.Tensor],
+    ) -> torch.Tensor:
+        assert self.slot_update_transformer is not None
+        assert self.slot_update_norm_state is not None
+        assert self.slot_update_norm_update is not None
+        assert self.slot_update_role_embed is not None
+        assert self.slot_update_iter_embed is not None
+
+        bsz, num_slots, slot_size = slots_prev.shape
+        history = torch.stack(slot_history, dim=2)
+        history_len = history.shape[2]
+        self._check_update_positions(history_len + 1)
+
+        history_tokens = self.slot_update_norm_state(history)
+        history_tokens = history_tokens + self.slot_update_role_embed[:, :1].view(1, 1, 1, slot_size)
+        history_tokens = history_tokens + self.slot_update_iter_embed[:, :history_len].view(
+            1, 1, history_len, slot_size
+        )
+
+        update_tokens = self.slot_update_norm_update(updates).unsqueeze(2)
+        update_tokens = update_tokens + self.slot_update_role_embed[:, 1:2].view(1, 1, 1, slot_size)
+        update_tokens = update_tokens + self.slot_update_iter_embed[:, history_len:history_len + 1].view(
+            1, 1, 1, slot_size
+        )
+
+        tokens = torch.cat((history_tokens, update_tokens), dim=2)
+        encoded = self.slot_update_transformer(
+            tokens.reshape(bsz * num_slots, history_len + 1, slot_size)
+        )
+        next_state = encoded[:, -1].view(bsz, num_slots, slot_size)
+        return self._finalize_transformer_slot_update(slots_prev, next_state)
+
+    def _slot_update_temporal_global(
+        self,
+        slots_prev: torch.Tensor,
+        updates: torch.Tensor,
+        *,
+        slot_history: list[torch.Tensor],
+    ) -> torch.Tensor:
+        assert self.slot_update_transformer is not None
+        assert self.slot_update_norm_state is not None
+        assert self.slot_update_norm_update is not None
+        assert self.slot_update_role_embed is not None
+        assert self.slot_update_slot_embed is not None
+        assert self.slot_update_iter_embed is not None
+
+        bsz, num_slots, slot_size = slots_prev.shape
+        history = torch.stack(slot_history, dim=1)
+        history_len = history.shape[1]
+        self._check_update_positions(history_len + 1)
+
+        slot_pos = self.slot_update_slot_embed[:, :num_slots].view(1, 1, num_slots, slot_size)
+        iter_pos = self.slot_update_iter_embed[:, :history_len].view(1, history_len, 1, slot_size)
+        history_tokens = (
+            self.slot_update_norm_state(history)
+            + slot_pos
+            + iter_pos
+            + self.slot_update_role_embed[:, :1].view(1, 1, 1, slot_size)
+        )
+
+        update_tokens = self.slot_update_norm_update(updates).unsqueeze(1)
+        update_tokens = (
+            update_tokens
+            + slot_pos
+            + self.slot_update_iter_embed[:, history_len:history_len + 1].view(1, 1, 1, slot_size)
+            + self.slot_update_role_embed[:, 1:2].view(1, 1, 1, slot_size)
+        )
+
+        tokens = torch.cat((history_tokens, update_tokens), dim=1)
+        encoded = self.slot_update_transformer(
+            tokens.reshape(bsz, (history_len + 1) * num_slots, slot_size)
+        )
+        next_state = encoded[:, -num_slots:]
+        return self._finalize_transformer_slot_update(slots_prev, next_state)
+
+    def _apply_slot_update(
+        self,
+        slots_prev: torch.Tensor,
+        updates: torch.Tensor,
+        *,
+        slot_history: Optional[list[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        if self.slot_update_mode == "gru":
+            slots = self.gru(
+                updates.view(-1, self.slot_size),
+                slots_prev.reshape(-1, self.slot_size),
+            )
+            return slots.view(-1, self.num_slots, self.slot_size)
+        if self.slot_update_mode == "transformer_pair_slotwise":
+            return self._slot_update_pair_slotwise(slots_prev, updates)
+        if self.slot_update_mode == "transformer_pair_global":
+            return self._slot_update_pair_global(slots_prev, updates)
+
+        if slot_history is None:
+            slot_history = [slots_prev]
+        if self.slot_update_mode == "transformer_temporal_slotwise":
+            return self._slot_update_temporal_slotwise(
+                slots_prev,
+                updates,
+                slot_history=slot_history,
+            )
+        if self.slot_update_mode == "transformer_temporal_global":
+            return self._slot_update_temporal_global(
+                slots_prev,
+                updates,
+                slot_history=slot_history,
+            )
+        raise RuntimeError(f"Unhandled slot update mode: {self.slot_update_mode}")
 
     def _attn_to_assignments(self, attn_vis: torch.Tensor) -> torch.Tensor:
         attn = attn_vis.sum(dim=1)
@@ -424,6 +738,9 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         total_iterations = self.num_iterations if num_iterations is None else int(num_iterations)
         if total_iterations <= 0:
             raise ValueError(f"num_iterations must be positive (got {total_iterations})")
+        if self._uses_temporal_slot_update:
+            self._check_update_positions(total_iterations + 1)
+        slot_history: Optional[list[torch.Tensor]] = [slots] if self._uses_temporal_slot_update else None
         for iteration in range(total_iterations):
             is_last_iter = iteration == (total_iterations - 1)
 
@@ -435,6 +752,11 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                 elif self.truncate == 'fixed-point':
                     # Fully detach slots (no gradient through iterations)
                     slots = slots.detach()
+            slot_history_for_iter = (
+                self._truncate_slot_history(slot_history, slots_init)
+                if is_last_iter and self.truncate != "none"
+                else slot_history
+            )
 
             if attn_override is not None and iteration == 0:
                 slots, attn_vis = self.slot_iter_guided(
@@ -444,6 +766,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                     attn_override=attn_override,
                     token_mask=valid_token_mask,
                     guided_grad_substitute=guided_grad_substitute,
+                    slot_history=slot_history_for_iter,
                 )
             else:
                 compute_crf = bool(
@@ -464,9 +787,12 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                     compute_crf=compute_crf,
                     apply_crf=apply_crf,
                     is_last_iter=is_last_iter,
+                    slot_history=slot_history_for_iter,
                 )
                 if iter_info:
                     last_iter_info = iter_info
+            if slot_history is not None:
+                slot_history.append(slots)
 
         # Compute init loss for gaussian_pred mode: cosine distance between initial and final slots
         # This trains the MLP to predict initializations close to where slot attention converges
@@ -502,6 +828,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         compute_crf: bool = False,
         apply_crf: bool = False,
         is_last_iter: bool = True,
+        slot_history: Optional[list[torch.Tensor]] = None,
     ):
         slots_prev = slots
         slots = self.norm_slots(slots)
@@ -554,11 +881,13 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         # `updates` has shape: [batch_size, num_slots, slot_size].
 
         # Slot update.
-        slots = self.gru(updates.view(-1, self.slot_size),
-                         slots_prev.reshape(-1, self.slot_size))
-        slots = slots.view(-1, self.num_slots, self.slot_size)
-
-        slots = slots + self.mlp(self.norm_mlp(slots))
+        slots = self._apply_slot_update(
+            slots_prev,
+            updates,
+            slot_history=slot_history,
+        )
+        if self.slot_update_post_mlp:
+            slots = slots + self.mlp(self.norm_mlp(slots))
 
         output_attn = (
             effective_attn_vis
@@ -585,6 +914,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         attn_override: torch.Tensor,
         token_mask: Optional[torch.Tensor] = None,
         guided_grad_substitute: bool = False,
+        slot_history: Optional[list[torch.Tensor]] = None,
     ):
         """
         Execute a single slot iteration where the attention weights are provided externally
@@ -636,12 +966,13 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         updates = torch.einsum('...is,...id->...sd', attn, v)
         updates = rearrange(updates, 'b h n_s d -> b n_s (h d)')
 
-        slots = self.gru(
-            updates.view(-1, self.slot_size),
-            slots_prev.reshape(-1, self.slot_size),
+        slots = self._apply_slot_update(
+            slots_prev,
+            updates,
+            slot_history=slot_history,
         )
-        slots = slots.view(-1, self.num_slots, self.slot_size)
-        slots = slots + self.mlp(self.norm_mlp(slots))
+        if self.slot_update_post_mlp:
+            slots = slots + self.mlp(self.norm_mlp(slots))
 
         return slots, attn_teacher
 

@@ -751,6 +751,7 @@ def build_slot_model_components(cfg: Dict[str, Any], device: torch.device):
         qk_rmsnorm_eps=sa_cfg.get("qk_rmsnorm_eps", 1e-6),
         init_mode=sa_cfg.get("init_mode", "gaussian"),
         kmeans_iters=sa_cfg.get("kmeans_iters", 10),
+        update_cfg=sa_cfg.get("update", {}),
         token_crf_cfg=cfg.get("crf", {}),
     ).to(device)
 
