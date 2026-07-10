@@ -26,7 +26,8 @@ DEFAULT_PROBE_CONFIG: Dict[str, object] = {
     "enabled": False,
     "every_updates": 50_000,
     "batch_size": 256,
-    "train_steps": 3000,
+    "train_steps": 30_000,
+    "val_every_steps": 5000,
     "lr": 1.0e-3,
     "weight_decay": 1.0e-4,
     "hidden_dim": 1024,
@@ -37,7 +38,7 @@ DEFAULT_PROBE_CONFIG: Dict[str, object] = {
     "max_samples_train": None,
     "max_samples_val": None,
     "seed": 0,
-    "log_every": 500,
+    "log_every": 2000,
 }
 
 
@@ -319,6 +320,7 @@ def run_slot_probe_eval(
     probe_cfg = {**DEFAULT_PROBE_CONFIG, **(probe_cfg or {})}
     batch_size = int(probe_cfg["batch_size"])
     train_steps = int(probe_cfg["train_steps"])
+    val_every_steps = int(probe_cfg["val_every_steps"])
     pos_weight = float(probe_cfg["pos_weight"])
     log_every = int(probe_cfg["log_every"])
     seed = int(probe_cfg["seed"])
@@ -370,6 +372,8 @@ def run_slot_probe_eval(
             train_stats = _ProbeStats(num_classes)
             train_loss_sum = 0.0
             train_loss_batches = 0
+            best_val_acc = -1.0
+            best_val_step = -1
 
             mlp.train()
             for step in range(1, train_steps + 1):
@@ -410,11 +414,33 @@ def run_slot_probe_eval(
                         flush=True,
                     )
 
+                # Periodic validation on cached slots: long probe trainings can
+                # overfit, so track the best val accuracy seen along the way.
+                if val_every_steps > 0 and step % val_every_steps == 0 and step < train_steps:
+                    _mid_loss, mid_stats = _evaluate_cached(
+                        val_cache, mlp,
+                        num_classes=num_classes, batch_size=batch_size,
+                        pos_weight=pos_weight, device=device,
+                    )
+                    mid_acc = mid_stats.accuracy()
+                    print(
+                        f"[slot probe] step {step}/{train_steps} "
+                        f"val_acc={mid_acc:.4f} val_macro_acc={mid_stats.macro_accuracy():.4f}",
+                        flush=True,
+                    )
+                    if mid_acc > best_val_acc:
+                        best_val_acc = mid_acc
+                        best_val_step = step
+                    mlp.train()
+
             val_loss, val_stats = _evaluate_cached(
                 val_cache, mlp,
                 num_classes=num_classes, batch_size=batch_size,
                 pos_weight=pos_weight, device=device,
             )
+            if val_stats.accuracy() > best_val_acc:
+                best_val_acc = val_stats.accuracy()
+                best_val_step = train_steps
 
         elapsed = time.time() - start_time
         results = {
@@ -423,6 +449,8 @@ def run_slot_probe_eval(
             "probe/val_class_macro_acc": val_stats.macro_accuracy(),
             "probe/val_center_mse": val_stats.center_mse(),
             "probe/val_matched_objects": float(val_stats.matched),
+            "probe/best_val_class_acc": float(best_val_acc),
+            "probe/best_val_step": float(best_val_step),
             "probe/train_loss": train_loss_sum / max(train_loss_batches, 1),
             "probe/train_class_acc": train_stats.accuracy(),
             "probe/train_center_mse": train_stats.center_mse(),

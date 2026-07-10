@@ -73,7 +73,8 @@ def make_final_slot_crf_base() -> dict:
         "enabled": True,
         "every_updates": 50_000,
         "batch_size": 256,
-        "train_steps": 3000,
+        "train_steps": 30_000,
+        "val_every_steps": 5000,
         "lr": 1.0e-3,
         "weight_decay": 1.0e-4,
         "hidden_dim": 1024,
@@ -84,7 +85,7 @@ def make_final_slot_crf_base() -> dict:
         "max_samples_train": None,
         "max_samples_val": None,
         "seed": 0,
-        "log_every": 500,
+        "log_every": 2000,
     }
     return cfg
 
