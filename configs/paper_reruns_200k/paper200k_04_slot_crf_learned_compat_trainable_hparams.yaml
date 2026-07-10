@@ -231,6 +231,7 @@ slot_probe:
   enabled: true
   every_updates: 50000
   batch_size: 256
+  extract_batch_size: 64
   train_steps: 30000
   val_every_steps: 5000
   lr: 0.001
@@ -239,7 +240,7 @@ slot_probe:
   num_hidden_layers: 2
   dropout: 0.25
   pos_weight: 1.0
-  num_workers: 8
+  num_workers: 0
   max_samples_train: null
   max_samples_val: null
   seed: 0

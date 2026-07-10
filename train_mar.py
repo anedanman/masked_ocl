@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import logging
 import math
@@ -1527,6 +1528,18 @@ def main():
             if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                 torch.compiler.cudagraph_mark_step_begin()
 
+            # Persistent training workers hold copy-on-write references to the
+            # multi-gigabyte COCO annotation graph. Stop them while the probe
+            # builds its own property-enabled loader, then recreate the iterator
+            # after the probe. Without this, the host can OOM before extraction.
+            shutdown_workers = getattr(train_iter, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
+            if getattr(train_loader, "_iterator", None) is train_iter:
+                train_loader._iterator = None
+            del train_iter
+            gc.collect()
+
             slot_attn.eval()
             decoder.eval()
             use_ema_for_probe = use_ema and ema_params is not None and ema_cfg.get("use_for_val", True)
@@ -1562,6 +1575,10 @@ def main():
             finally:
                 if probe_params_backup is not None:
                     restore_model_params(probe_params_backup, [slot_attn, decoder])
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                train_iter = iter(train_loader)
 
         global_step += 1
 

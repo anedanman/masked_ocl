@@ -103,6 +103,7 @@ def make_final_slot_crf_base() -> dict:
         "enabled": True,
         "every_updates": 50_000,
         "batch_size": 256,
+        "extract_batch_size": 64,
         "train_steps": 30_000,
         "val_every_steps": 5000,
         "lr": 1.0e-3,
@@ -111,7 +112,7 @@ def make_final_slot_crf_base() -> dict:
         "num_hidden_layers": 2,
         "dropout": 0.25,
         "pos_weight": 1.0,
-        "num_workers": 8,
+        "num_workers": 0,
         "max_samples_train": None,
         "max_samples_val": None,
         "seed": 0,
@@ -184,7 +185,7 @@ def run_variants(paths: dict[str, Path], variant_ids: list[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate and run the four 200k COCO paper reruns."
+        description="Generate and run the eight 200k COCO paper reruns."
     )
     parser.add_argument(
         "--ids",

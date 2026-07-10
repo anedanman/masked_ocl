@@ -10,6 +10,7 @@ in CPU memory, so probe training itself only touches the cached tensors.
 
 from __future__ import annotations
 
+import gc
 import time
 from typing import Dict, Optional, Tuple
 
@@ -26,6 +27,7 @@ DEFAULT_PROBE_CONFIG: Dict[str, object] = {
     "enabled": False,
     "every_updates": 50_000,
     "batch_size": 256,
+    "extract_batch_size": 64,
     "train_steps": 30_000,
     "val_every_steps": 5000,
     "lr": 1.0e-3,
@@ -34,7 +36,7 @@ DEFAULT_PROBE_CONFIG: Dict[str, object] = {
     "num_hidden_layers": 2,
     "dropout": 0.25,
     "pos_weight": 1.0,
-    "num_workers": 8,
+    "num_workers": 0,
     "max_samples_train": None,
     "max_samples_val": None,
     "seed": 0,
@@ -175,8 +177,8 @@ def _build_probe_loaders(cfg: Dict, probe_cfg: Dict) -> Dict[str, torch.utils.da
     dataset = str(data_cfg.get("dataset", "coco")).lower()
     image_size = int(data_cfg.get("image_size", 256))
     max_objects = data_cfg.get("max_objects", None)
-    batch_size = int(probe_cfg.get("batch_size", 256))
-    num_workers = int(probe_cfg.get("num_workers", 8))
+    batch_size = int(probe_cfg.get("extract_batch_size", 64))
+    num_workers = int(probe_cfg.get("num_workers", 0))
     max_samples_train = probe_cfg.get("max_samples_train", None)
     max_samples_val = probe_cfg.get("max_samples_val", None)
 
@@ -240,10 +242,12 @@ def _extract_slot_dataset(
     autocast_kwargs: Dict,
     desc: str,
 ) -> Dict[str, torch.Tensor]:
-    slots_all = []
-    class_all = []
-    centers_all = []
-    presence_all = []
+    dataset_size = len(loader.dataset)
+    slots_cache: Optional[torch.Tensor] = None
+    class_cache: Optional[torch.Tensor] = None
+    centers_cache: Optional[torch.Tensor] = None
+    presence_cache: Optional[torch.Tensor] = None
+    offset = 0
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         props = batch["properties"]
@@ -254,18 +258,41 @@ def _extract_slot_dataset(
             else:
                 feats = extract_features(images, dino, return_cls_token=False)
                 slots, _attn, _init_loss = slot_attn(feats)
-        slots_all.append(slots.detach().float().cpu())
+        batch_slots = slots.detach().float().cpu()
         class_idx, centers, presence = _compact_properties(props, num_classes)
-        class_all.append(class_idx)
-        centers_all.append(centers)
-        presence_all.append(presence)
-    if not slots_all:
+
+        if slots_cache is None:
+            slots_cache = torch.empty(
+                (dataset_size, *batch_slots.shape[1:]), dtype=batch_slots.dtype
+            )
+            class_cache = torch.empty(
+                (dataset_size, *class_idx.shape[1:]), dtype=class_idx.dtype
+            )
+            centers_cache = torch.empty(
+                (dataset_size, *centers.shape[1:]), dtype=centers.dtype
+            )
+            presence_cache = torch.empty(
+                (dataset_size, *presence.shape[1:]), dtype=presence.dtype
+            )
+
+        end = offset + batch_slots.shape[0]
+        if end > dataset_size:
+            raise RuntimeError(
+                f"Slot probe loader for '{desc}' produced more than {dataset_size} samples."
+            )
+        slots_cache[offset:end].copy_(batch_slots)
+        class_cache[offset:end].copy_(class_idx)
+        centers_cache[offset:end].copy_(centers)
+        presence_cache[offset:end].copy_(presence)
+        offset = end
+
+    if slots_cache is None or class_cache is None or centers_cache is None or presence_cache is None:
         raise RuntimeError(f"Slot probe: no batches produced for split '{desc}'.")
     return {
-        "slots": torch.cat(slots_all, dim=0),
-        "class": torch.cat(class_all, dim=0),
-        "centers": torch.cat(centers_all, dim=0),
-        "presence": torch.cat(presence_all, dim=0),
+        "slots": slots_cache[:offset],
+        "class": class_cache[:offset],
+        "centers": centers_cache[:offset],
+        "presence": presence_cache[:offset],
     }
 
 
@@ -350,6 +377,9 @@ def run_slot_probe_eval(
                 device=device, autocast_kwargs=autocast_kwargs, desc="val",
             )
             del loaders
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
             num_train = train_cache["slots"].shape[0]
             slot_dim = train_cache["slots"].shape[-1]
@@ -458,6 +488,10 @@ def run_slot_probe_eval(
             "probe/train_steps": float(train_steps),
             "probe/elapsed_seconds": float(elapsed),
         }
+        del optimizer, mlp, train_cache, val_cache
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         return results
     finally:
         if was_training:
