@@ -1,4 +1,5 @@
 import argparse
+import copy
 import gc
 import json
 import logging
@@ -275,6 +276,136 @@ def _resolve_scheduled_lambda(loss_cfg: Dict[str, object], *, default_end: float
     return start, end, warmup, ramp
 
 
+def run_final_mask_eval(
+    *,
+    cfg: Dict,
+    dino,
+    slot_attn,
+    decoder,
+    device: torch.device,
+    autocast_kwargs: Dict,
+    need_cls_token: bool,
+    crf_enabled: bool,
+    semantic_eval_enabled: bool,
+    pixel_crf_sources: List[str],
+    pixel_crf_method: str,
+    max_images: Optional[int],
+    metric_name_map: Dict[str, str],
+) -> Dict[str, float]:
+    """End-of-training mask eval on up to ``max_images`` validation images.
+
+    Computes the standard mask metrics for the raw upscaled SA/decoder masks
+    and their dense-CRF-refined versions (CutLER parameters), independent of
+    the capped per-validation pixel-CRF eval. Keys are ``final_val_*``.
+    """
+    eval_cfg = copy.deepcopy(cfg)
+    eval_cfg.setdefault("train", {})["max_samples_val"] = max_images
+    loader = prepare_dataloaders(eval_cfg)["val"]
+
+    eval_targets = ["instance"] + (["semantic"] if semantic_eval_enabled else [])
+    buckets = ["sa", "dec"] + [f"{s}_crf" for s in pixel_crf_sources]
+    metrics = {
+        target: {bucket: create_spot_metrics(device, target) for bucket in buckets}
+        for target in eval_targets
+    }
+    bucket_prefixes = {"sa": "sa", "dec": "decoder", "sa_crf": "sa_crf", "dec_crf": "decoder_crf"}
+
+    slot_attn.eval()
+    decoder.eval()
+    num_images = 0
+    iterator = tqdm(loader, desc="final mask eval", dynamic_ncols=True) if _TQDM_AVAILABLE else loader
+    with torch.inference_mode():
+        for batch in iterator:
+            images = batch["image"].to(device)
+            gt_masks = batch.get("masks", None)
+            if gt_masks is None:
+                continue
+            gt_masks = gt_masks.to(device)
+            target_sets: Dict[str, torch.Tensor] = {"instance": gt_masks}
+            if semantic_eval_enabled:
+                categories = batch.get("categories", None)
+                if categories is not None:
+                    semantic_masks, _ = merge_instance_masks_by_category(
+                        gt_masks, categories.to(device)
+                    )
+                    target_sets["semantic"] = semantic_masks
+
+            with torch.autocast(**autocast_kwargs):
+                if need_cls_token:
+                    feats, cls_token = extract_features(images, dino, return_cls_token=True)
+                else:
+                    feats = extract_features(images, dino)
+                    cls_token = None
+                B, D, Hf, Wf = feats.shape
+                slot_info = None
+                if crf_enabled:
+                    slots, attn_vis, _, slot_info = slot_attn(
+                        feats, cls_token=cls_token, return_info=True
+                    )
+                else:
+                    slots, attn_vis, _ = slot_attn(feats, cls_token=cls_token)
+                output = decoder(feats, slots, attn_vis, slot_info=slot_info)
+                dec_masks = output.decoder_masks
+            if dec_masks is None:
+                continue
+            if dec_masks.shape[1] != slots.shape[1]:
+                dec_masks = dec_masks[:, : slots.shape[1]]
+
+            sa_masks_img = F.interpolate(
+                attn_to_slot_masks(attn_vis, Hf, Wf), size=images.shape[-2:], mode="bilinear"
+            ).detach()
+            dec_masks_img = F.interpolate(
+                dec_masks.squeeze(2), size=images.shape[-2:], mode="bilinear"
+            ).detach()
+
+            source_masks = {"sa": sa_masks_img, "dec": dec_masks_img}
+            refined_by_source: Dict[str, torch.Tensor] = {}
+            with torch.autocast(device_type=device.type, enabled=False):
+                for src_name in pixel_crf_sources:
+                    src = source_masks.get(src_name)
+                    if src is None:
+                        continue
+                    probs = src.float()
+                    probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                    refined = crf_refine_batch(
+                        images, probs, denorm_img=True, method=pixel_crf_method
+                    )
+                    refined_by_source[f"{src_name}_crf"] = refined.to(
+                        device=device, dtype=torch.float32
+                    )
+
+            ignore_mask = batch.get("ignore_mask", None)
+            if ignore_mask is not None:
+                ignore_mask = ignore_mask.to(device)
+                if ignore_mask.ndim == 3:
+                    ignore_mask = ignore_mask.unsqueeze(1)
+
+            for target_name, target_gt_raw in target_sets.items():
+                target_gt = add_background_channel(target_gt_raw.detach())
+                bucket_group = metrics[target_name]
+                for metric in bucket_group["sa"].values():
+                    metric.update(sa_masks_img, target_gt, ignore_mask)
+                for metric in bucket_group["dec"].values():
+                    metric.update(dec_masks_img, target_gt, ignore_mask)
+                for src_key, refined in refined_by_source.items():
+                    for metric in bucket_group[src_key].values():
+                        metric.update(refined, target_gt, ignore_mask)
+            num_images += int(images.shape[0])
+
+    results: Dict[str, float] = {"final_val/num_images": float(num_images)}
+    for target_name, bucket_group in metrics.items():
+        for bucket_key, bucket in bucket_group.items():
+            prefix = f"final_val_{target_name}/{bucket_prefixes.get(bucket_key, bucket_key)}"
+            for name, metric in bucket.items():
+                metric_label = metric_name_map.get(name, name)
+                for suffix, scalar in flatten_metric_output(metric.compute()):
+                    key = f"{prefix}/{metric_label}"
+                    if suffix:
+                        key = f"{key}/{suffix}"
+                    results[key] = scalar * 100.0
+    return results
+
+
 def _scalarize_results(results: Dict[str, object]) -> Dict[str, float]:
     scalars: Dict[str, float] = {}
     for key, value in results.items():
@@ -309,6 +440,7 @@ def main():
     out_dir = prepare_run_dir(cfg, args.config)
     summary_path = os.path.join(out_dir, "train_summary.json")
     latest_validation_summary: Optional[Dict[str, float]] = None
+    final_validation_summary: Optional[Dict[str, float]] = None
 
     def write_training_summary(status: str) -> None:
         payload: Dict[str, object] = {
@@ -326,6 +458,8 @@ def main():
         }
         if latest_validation_summary is not None:
             payload["latest_validation"] = latest_validation_summary
+        if final_validation_summary is not None:
+            payload["final_validation"] = final_validation_summary
         with open(summary_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
 
@@ -631,6 +765,7 @@ def main():
     pixel_crf_sources = [str(s) for s in (pixel_crf_cfg.get("sources", ["sa", "dec"]) or [])]
     pixel_crf_method = str(pixel_crf_cfg.get("method", "pydensecrf"))
     pixel_crf_max_batches = int(pixel_crf_cfg.get("max_batches", 8))
+    pixel_crf_final_images = pixel_crf_cfg.get("final_images", 5000)
     if pixel_crf_enabled:
         pixel_crf_backend = (
             "pydensecrf" if (pixel_crf_method == "pydensecrf" and _HAS_PYDENSECRF) else "torch"
@@ -1656,6 +1791,49 @@ def main():
 
     if pbar is not None:
         pbar.close()
+
+    run_final_eval = pixel_crf_enabled and (
+        pixel_crf_final_images is None or int(pixel_crf_final_images) != 0
+    )
+    if run_final_eval:
+        use_ema_for_final = use_ema and ema_params is not None and ema_cfg.get("use_for_val", True)
+        final_params_backup: Optional[List[torch.Tensor]] = None
+        if use_ema_for_final:
+            final_params_backup = load_ema_to_model(ema_params, [slot_attn, decoder])
+        try:
+            print(
+                f"Running final mask eval on up to "
+                f"{pixel_crf_final_images if pixel_crf_final_images else 'all'} val images..."
+            )
+            final_results = run_final_mask_eval(
+                cfg=cfg,
+                dino=dino,
+                slot_attn=slot_attn,
+                decoder=decoder,
+                device=device,
+                autocast_kwargs=autocast_kwargs,
+                need_cls_token=need_cls_token,
+                crf_enabled=crf_enabled,
+                semantic_eval_enabled=semantic_eval_enabled,
+                pixel_crf_sources=pixel_crf_sources,
+                pixel_crf_method=pixel_crf_method,
+                max_images=(int(pixel_crf_final_images) if pixel_crf_final_images else None),
+                metric_name_map=metric_name_map,
+            )
+            final_validation_summary = _scalarize_results(final_results)
+            print(
+                f"[final eval] {int(final_results.get('final_val/num_images', 0))} images | "
+                f"decoder mBO_i={final_results.get('final_val_instance/decoder/mBO_i', float('nan')):.2f} "
+                f"decoder_crf mBO_i={final_results.get('final_val_instance/decoder_crf/mBO_i', float('nan')):.2f}"
+            )
+            if use_wandb:
+                wandb.log(final_results, step=global_step)
+        except Exception:
+            print("WARNING: final mask eval failed; training results are unaffected.")
+            traceback.print_exc()
+        finally:
+            if final_params_backup is not None:
+                restore_model_params(final_params_backup, [slot_attn, decoder])
 
     if best_val_loss_step >= 0 and math.isfinite(best_val_loss):
         print(f"Best validation loss: step {best_val_loss_step} (val_loss={best_val_loss:.6f})")

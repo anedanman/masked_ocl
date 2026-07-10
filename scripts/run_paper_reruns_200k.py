@@ -90,6 +90,7 @@ def make_final_slot_crf_base() -> dict:
         "sources": ["sa", "dec"],
         "method": "pydensecrf",
         "max_batches": 8,
+        "final_images": 5000,
     }
     cfg["crf"]["compatibility"] = {
         "type": "cosine_mlp",
