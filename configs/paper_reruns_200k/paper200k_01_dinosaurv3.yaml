@@ -43,7 +43,7 @@ train:
     every_updates: 10000
     keep_last: 1
     resume_path: null
-    resume_latest: false
+    resume_latest: true
   amp: true
   amp_dtype: bfloat16
   dino_cache:

@@ -80,6 +80,9 @@ def make_final_slot_crf_base() -> dict:
     cfg = load_yaml(BASE_CONFIG)
     cfg["train"]["max_updates"] = 200_002
     cfg["train"]["seed"] = 42
+    # Relaunches/crashes resume from the newest checkpoint_step*.pt in the
+    # run dir instead of restarting from scratch.
+    cfg["train"]["ckpt"]["resume_latest"] = True
     cfg["crf"]["compatibility"] = {
         "type": "cosine_mlp",
         "hidden_dim": 512,
