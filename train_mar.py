@@ -48,6 +48,7 @@ except Exception:
     torchvision = None
     _TORCHVISION_AVAILABLE = False
 
+from src.evaluation.crf import _HAS_PYDENSECRF, crf_refine_batch
 from src.evaluation.slot_probe import run_slot_probe_eval
 from src.training import (
     add_background_channel,
@@ -622,6 +623,23 @@ def main():
     if semantic_eval_enabled:
         eval_target_sets.append("semantic")
 
+    # Pixel-level dense-CRF refinement of the upscaled masks (CutLER params)
+    # evaluated with the same mask metrics, on the first `max_batches` val
+    # batches (pydensecrf runs on CPU, so this is capped to bound val time).
+    pixel_crf_cfg = dict(train_cfg.get("pixel_crf_eval", {}) or {})
+    pixel_crf_enabled = bool(pixel_crf_cfg.get("enabled", False))
+    pixel_crf_sources = [str(s) for s in (pixel_crf_cfg.get("sources", ["sa", "dec"]) or [])]
+    pixel_crf_method = str(pixel_crf_cfg.get("method", "pydensecrf"))
+    pixel_crf_max_batches = int(pixel_crf_cfg.get("max_batches", 8))
+    if pixel_crf_enabled:
+        pixel_crf_backend = (
+            "pydensecrf" if (pixel_crf_method == "pydensecrf" and _HAS_PYDENSECRF) else "torch"
+        )
+        print(
+            f"Pixel CRF eval enabled: sources={pixel_crf_sources}, backend={pixel_crf_backend}, "
+            f"max_batches={pixel_crf_max_batches}."
+        )
+
     metrics_device = device
     metrics_val = {}
     for target in eval_target_sets:
@@ -629,6 +647,9 @@ def main():
             "sa": create_spot_metrics(metrics_device, target),
             "dec": create_spot_metrics(metrics_device, target),
         }
+        if pixel_crf_enabled:
+            for src_name in pixel_crf_sources:
+                metrics_val[target][f"{src_name}_crf"] = create_spot_metrics(metrics_device, target)
     metric_name_map = {
         "mBO_i": "mBO_i",
         "mBO_c": "mBO_c",
@@ -1205,10 +1226,9 @@ def main():
 
             with torch.inference_mode():
                 for metric_group in metrics_val.values():
-                    for metric in metric_group["sa"].values():
-                        metric.reset()
-                    for metric in metric_group["dec"].values():
-                        metric.reset()
+                    for bucket in metric_group.values():
+                        for metric in bucket.values():
+                            metric.reset()
 
                 val_losses: List[float] = []
                 val_sa_guidance_losses: List[float] = []
@@ -1222,8 +1242,10 @@ def main():
                 compat_grids: List[torch.Tensor] = []
                 compat_viz_target = int(cfg.get("wandb", {}).get("compat_viz_count", 8)) if use_wandb else 0
                 target_metrics_active: Dict[str, bool] = {name: False for name in metrics_val}
+                val_batch_index = -1
 
                 for batch in val_loader:
+                    val_batch_index += 1
                     images = batch["image"].to(device)
                     gt_masks = batch.get("masks", None)
                     if gt_masks is None:
@@ -1408,6 +1430,27 @@ def main():
 
                     sa_masks_img_det = sa_masks_img.detach()
                     dec_masks_img_det = dec_masks_img.detach()
+
+                    crf_masks_by_source: Dict[str, torch.Tensor] = {}
+                    if pixel_crf_enabled and val_batch_index < pixel_crf_max_batches:
+                        source_masks = {"sa": sa_masks_img_det, "dec": dec_masks_img_det}
+                        with torch.autocast(device_type=device.type, enabled=False):
+                            for src_name in pixel_crf_sources:
+                                src = source_masks.get(src_name)
+                                if src is None:
+                                    continue
+                                probs = src.float()
+                                probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                                refined = crf_refine_batch(
+                                    images,
+                                    probs,
+                                    denorm_img=True,
+                                    method=pixel_crf_method,
+                                )
+                                crf_masks_by_source[f"{src_name}_crf"] = refined.to(
+                                    device=device, dtype=torch.float32
+                                )
+
                     target_sets_det = {name: masks.detach() for name, masks in target_sets.items()}
                     target_sets_metric = {
                         name: add_background_channel(masks) for name, masks in target_sets_det.items()
@@ -1424,6 +1467,9 @@ def main():
                             metric.update(sa_masks_img_det, target_gt, ignore_mask)
                         for metric in metric_bucket["dec"].values():
                             metric.update(dec_masks_img_det, target_gt, ignore_mask)
+                        for src_key, refined_masks in crf_masks_by_source.items():
+                            for metric in metric_bucket[src_key].values():
+                                metric.update(refined_masks, target_gt, ignore_mask)
                         target_metrics_active[target_name] = True
 
                     if use_wandb and _TORCHVISION_AVAILABLE and len(viz_grids) < viz_target:
@@ -1485,35 +1531,27 @@ def main():
                         )
                 metric_values_for_avg: List[float] = []
 
+                bucket_prefixes = {"sa": "sa", "dec": "decoder", "sa_crf": "sa_crf", "dec_crf": "decoder_crf"}
                 for target_name, metric_group in metrics_val.items():
                     if not target_metrics_active.get(target_name, False):
                         continue
 
-                    sa_prefix = f"val_{target_name}/sa"
-                    for name, metric in metric_group["sa"].items():
-                        metric_label = metric_name_map.get(name, name)
-                        metric_value = metric.compute()
-                        for suffix, scalar in flatten_metric_output(metric_value):
-                            scalar *= 100.0
-                            key = f"{sa_prefix}/{metric_label}"
-                            if suffix:
-                                key = f"{key}/{suffix}"
-                            results[key] = scalar
-                            if math.isfinite(scalar):
-                                metric_values_for_avg.append(scalar)
-
-                    dec_prefix = f"val_{target_name}/decoder"
-                    for name, metric in metric_group["dec"].items():
-                        metric_label = metric_name_map.get(name, name)
-                        metric_value = metric.compute()
-                        for suffix, scalar in flatten_metric_output(metric_value):
-                            scalar *= 100.0
-                            key = f"{dec_prefix}/{metric_label}"
-                            if suffix:
-                                key = f"{key}/{suffix}"
-                            results[key] = scalar
-                            if math.isfinite(scalar):
-                                metric_values_for_avg.append(scalar)
+                    for bucket_key, bucket in metric_group.items():
+                        prefix = f"val_{target_name}/{bucket_prefixes.get(bucket_key, bucket_key)}"
+                        # Keep checkpoint selection (val/metrics_avg) based on the
+                        # original sa/dec metrics only, for comparability across runs.
+                        include_in_avg = not bucket_key.endswith("_crf")
+                        for name, metric in bucket.items():
+                            metric_label = metric_name_map.get(name, name)
+                            metric_value = metric.compute()
+                            for suffix, scalar in flatten_metric_output(metric_value):
+                                scalar *= 100.0
+                                key = f"{prefix}/{metric_label}"
+                                if suffix:
+                                    key = f"{key}/{suffix}"
+                                results[key] = scalar
+                                if include_in_avg and math.isfinite(scalar):
+                                    metric_values_for_avg.append(scalar)
 
                 if metric_values_for_avg:
                     metric_avg = float(sum(metric_values_for_avg) / len(metric_values_for_avg))

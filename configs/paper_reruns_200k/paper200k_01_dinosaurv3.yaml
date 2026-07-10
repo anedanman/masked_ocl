@@ -52,6 +52,13 @@ train:
     skip_image_loading: true
     backend: lmdb
     lmdb_map_size_gb: 256
+  pixel_crf_eval:
+    enabled: true
+    sources:
+    - sa
+    - dec
+    method: pydensecrf
+    max_batches: 8
 data:
   dataset: coco
   root: ./data/coco

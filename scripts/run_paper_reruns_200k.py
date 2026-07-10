@@ -83,6 +83,14 @@ def make_final_slot_crf_base() -> dict:
     # Relaunches/crashes resume from the newest checkpoint_step*.pt in the
     # run dir instead of restarting from scratch.
     cfg["train"]["ckpt"]["resume_latest"] = True
+    # CutLER-style dense-CRF refinement of upscaled masks, evaluated with the
+    # same mask metrics on the first max_batches val batches.
+    cfg["train"]["pixel_crf_eval"] = {
+        "enabled": True,
+        "sources": ["sa", "dec"],
+        "method": "pydensecrf",
+        "max_batches": 8,
+    }
     cfg["crf"]["compatibility"] = {
         "type": "cosine_mlp",
         "hidden_dim": 512,
