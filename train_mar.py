@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import traceback
 import warnings
 from typing import Dict, List, Optional
 
@@ -46,6 +47,7 @@ except Exception:
     torchvision = None
     _TORCHVISION_AVAILABLE = False
 
+from src.evaluation.slot_probe import run_slot_probe_eval
 from src.training import (
     add_background_channel,
     compute_distribution_matching_loss,
@@ -588,6 +590,9 @@ def main():
     if sched_cfg is None:
         sched_cfg = cfg.get("lr_schedule", None)
     scheduler = build_lr_scheduler(optim, sched_cfg, base_lr=lr, total_steps=int(max_updates))
+    probe_cfg = dict(cfg.get("slot_probe", train_cfg.get("slot_probe", {})) or {})
+    probe_enabled = bool(probe_cfg.get("enabled", False))
+    probe_every = int(probe_cfg.get("every_updates", 50000))
     val_every = train_cfg.get("val_every_updates", None)
     log_every = train_cfg.get("log_every_updates", cfg.get("wandb", {}).get("log_images_every", 200))
     val_iterative = bool(train_cfg.get("val_iterative", False))
@@ -1517,6 +1522,46 @@ def main():
             # Restore original weights after EMA validation
             if use_ema_for_val and original_params_backup is not None:
                 restore_model_params(original_params_backup, [slot_attn, decoder])
+
+        if probe_enabled and probe_every > 0 and global_step > 0 and (global_step % probe_every == 0):
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+
+            slot_attn.eval()
+            decoder.eval()
+            use_ema_for_probe = use_ema and ema_params is not None and ema_cfg.get("use_for_val", True)
+            probe_params_backup: Optional[List[torch.Tensor]] = None
+            if use_ema_for_probe:
+                probe_params_backup = load_ema_to_model(ema_params, [slot_attn, decoder])
+            try:
+                probe_results = run_slot_probe_eval(
+                    cfg=cfg,
+                    probe_cfg=probe_cfg,
+                    dino=dino,
+                    slot_attn=slot_attn,
+                    need_cls_token=need_cls_token,
+                    device=device,
+                    autocast_kwargs=autocast_kwargs,
+                )
+                print(
+                    f"[slot probe @ step {global_step}] "
+                    f"val_acc={probe_results['probe/val_class_acc']:.4f} "
+                    f"val_macro_acc={probe_results['probe/val_class_macro_acc']:.4f} "
+                    f"val_center_mse={probe_results['probe/val_center_mse']:.5f} "
+                    f"({probe_results['probe/elapsed_seconds']:.0f}s)"
+                )
+                if use_wandb:
+                    wandb.log(probe_results, step=global_step)
+            except Exception:
+                print(
+                    f"WARNING: slot probe eval failed at step {global_step}; continuing training."
+                )
+                traceback.print_exc()
+                if use_wandb:
+                    wandb.log({"probe/failed": 1.0}, step=global_step)
+            finally:
+                if probe_params_backup is not None:
+                    restore_model_params(probe_params_backup, [slot_attn, decoder])
 
         global_step += 1
 

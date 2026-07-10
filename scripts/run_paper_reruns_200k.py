@@ -69,6 +69,23 @@ def make_final_slot_crf_base() -> dict:
     cfg["wandb"]["enabled"] = True
     cfg["wandb"]["project"] = PROJECT
     cfg["wandb"]["mode"] = "online"
+    cfg["slot_probe"] = {
+        "enabled": True,
+        "every_updates": 50_000,
+        "batch_size": 256,
+        "train_steps": 3000,
+        "lr": 1.0e-3,
+        "weight_decay": 1.0e-4,
+        "hidden_dim": 1024,
+        "num_hidden_layers": 2,
+        "dropout": 0.25,
+        "pos_weight": 1.0,
+        "num_workers": 8,
+        "max_samples_train": None,
+        "max_samples_val": None,
+        "seed": 0,
+        "log_every": 500,
+    }
     return cfg
 
 
