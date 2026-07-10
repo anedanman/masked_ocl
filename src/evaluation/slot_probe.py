@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -87,16 +88,6 @@ class _ProbeStats:
         return float(self.center_sq_err) / max(self.matched * 2, 1)
 
 
-def _hungarian(cost: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    from scipy.optimize import linear_sum_assignment
-
-    row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
-    return (
-        torch.as_tensor(row_ind, device=cost.device, dtype=torch.long),
-        torch.as_tensor(col_ind, device=cost.device, dtype=torch.long),
-    )
-
-
 def matching_loss_and_stats(
     pred_logits: torch.Tensor,
     pred_centers: torch.Tensor,
@@ -107,66 +98,75 @@ def matching_loss_and_stats(
     pos_weight: float,
     stats: Optional[_ProbeStats] = None,
 ) -> torch.Tensor:
-    """Hungarian-matched set-prediction loss.
+    """Hungarian-matched set-prediction loss (batched, DETR-style).
+
+    The cost matrix is computed for the whole batch on-device and moved to CPU
+    with a single transfer; only ``linear_sum_assignment`` runs per sample.
+    The loss is then a single gathered cross-entropy/MSE over all matched
+    pairs, so the per-sample work never touches the GPU.
 
     pred_logits: [B, S, C], pred_centers: [B, S, 2] in [0, 1]
     tgt_class: [B, M] long, tgt_centers: [B, M, 2], tgt_presence: [B, M] bool
     """
+    from scipy.optimize import linear_sum_assignment
+
     device = pred_logits.device
-    total_class_loss = pred_logits.new_zeros(())
-    total_pos_loss = pred_logits.new_zeros(())
-    total_matches = 0
+    batch_size = pred_logits.shape[0]
 
-    for b in range(pred_logits.shape[0]):
-        present = tgt_presence[b]
-        num_gt = int(present.sum().item())
-        if num_gt == 0:
+    with torch.no_grad():
+        pred_probs = pred_logits.softmax(dim=-1)
+        cost_class = -torch.gather(
+            pred_probs, 2, tgt_class.unsqueeze(1).expand(-1, pred_probs.shape[1], -1)
+        )  # [B, S, M]
+        cost_pos = torch.cdist(pred_centers, tgt_centers.to(pred_centers.dtype), p=2) ** 2
+        cost_np = (cost_class + pos_weight * cost_pos).cpu().numpy()
+    presence_np = tgt_presence.cpu().numpy()
+
+    batch_ids = []
+    slot_ids = []
+    gt_ids = []
+    for b in range(batch_size):
+        valid = np.nonzero(presence_np[b])[0]
+        if valid.size == 0:
             continue
-        gt_class = tgt_class[b, present]
-        gt_centers = tgt_centers[b, present]
+        row_idx, col_idx = linear_sum_assignment(cost_np[b][:, valid])
+        batch_ids.append(np.full(row_idx.shape, b, dtype=np.int64))
+        slot_ids.append(row_idx.astype(np.int64))
+        gt_ids.append(valid[col_idx].astype(np.int64))
 
-        pred_probs = pred_logits[b].softmax(dim=-1)
-        cost_class = -pred_probs[:, gt_class]  # [S, G]
-        cost_pos = torch.cdist(pred_centers[b], gt_centers, p=2) ** 2
-        cost = cost_class + pos_weight * cost_pos
-
-        row_idx, col_idx = _hungarian(cost)
-        if row_idx.numel() == 0:
-            continue
-
-        matched_logits = pred_logits[b, row_idx]
-        matched_gt_class = gt_class[col_idx]
-        matched_centers = pred_centers[b, row_idx]
-        matched_gt_centers = gt_centers[col_idx]
-
-        total_class_loss = total_class_loss + F.cross_entropy(
-            matched_logits, matched_gt_class, reduction="sum"
-        )
-        total_pos_loss = total_pos_loss + F.mse_loss(
-            matched_centers, matched_gt_centers, reduction="sum"
-        )
-        total_matches += int(row_idx.numel())
-
-        if stats is not None:
-            with torch.no_grad():
-                pred_cls = matched_logits.argmax(dim=-1)
-                correct_mask = pred_cls == matched_gt_class
-                stats.matched += int(row_idx.numel())
-                stats.correct += int(correct_mask.sum().item())
-                stats.center_sq_err += float(
-                    ((matched_centers - matched_gt_centers) ** 2).sum().item()
-                )
-                gt_cpu = matched_gt_class.cpu()
-                stats.per_class_total += torch.bincount(
-                    gt_cpu, minlength=stats.per_class_total.numel()
-                )
-                stats.per_class_correct += torch.bincount(
-                    gt_cpu[correct_mask.cpu()], minlength=stats.per_class_correct.numel()
-                )
-
-    if total_matches == 0:
+    if not batch_ids:
         return pred_logits.new_zeros(())
-    return (total_class_loss + pos_weight * total_pos_loss) / total_matches
+
+    bi = torch.from_numpy(np.concatenate(batch_ids)).to(device)
+    si = torch.from_numpy(np.concatenate(slot_ids)).to(device)
+    gi = torch.from_numpy(np.concatenate(gt_ids)).to(device)
+
+    matched_logits = pred_logits[bi, si]  # [K, C]
+    matched_gt_class = tgt_class[bi, gi]  # [K]
+    matched_centers = pred_centers[bi, si]  # [K, 2]
+    matched_gt_centers = tgt_centers[bi, gi].to(pred_centers.dtype)
+    num_matches = int(bi.numel())
+
+    class_loss = F.cross_entropy(matched_logits, matched_gt_class, reduction="sum")
+    pos_loss = F.mse_loss(matched_centers, matched_gt_centers, reduction="sum")
+
+    if stats is not None:
+        with torch.no_grad():
+            correct_mask = matched_logits.argmax(dim=-1) == matched_gt_class
+            stats.matched += num_matches
+            stats.correct += int(correct_mask.sum().item())
+            stats.center_sq_err += float(
+                ((matched_centers - matched_gt_centers) ** 2).sum().item()
+            )
+            gt_cpu = matched_gt_class.cpu()
+            stats.per_class_total += torch.bincount(
+                gt_cpu, minlength=stats.per_class_total.numel()
+            )
+            stats.per_class_correct += torch.bincount(
+                gt_cpu[correct_mask.cpu()], minlength=stats.per_class_correct.numel()
+            )
+
+    return (class_loss + pos_weight * pos_loss) / num_matches
 
 
 def _build_probe_loaders(cfg: Dict, probe_cfg: Dict) -> Dict[str, torch.utils.data.DataLoader]:
@@ -395,10 +395,16 @@ def run_slot_probe_eval(
                     loss.backward()
                     optimizer.step()
 
+                # Only sync with the GPU when the loss value is actually used.
                 if step > train_steps - 200:
                     train_loss_sum += float(loss.item())
                     train_loss_batches += 1
-                if log_every > 0 and step % log_every == 0:
+                    if log_every > 0 and step % log_every == 0:
+                        print(
+                            f"[slot probe] step {step}/{train_steps} loss={train_loss_sum / train_loss_batches:.4f}",
+                            flush=True,
+                        )
+                elif log_every > 0 and step % log_every == 0:
                     print(
                         f"[slot probe] step {step}/{train_steps} loss={float(loss.item()):.4f}",
                         flush=True,
