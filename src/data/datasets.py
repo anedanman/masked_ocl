@@ -9,6 +9,26 @@ from torchvision.transforms import v2
 import torchvision.transforms.functional as TF
 
 
+def _load_coco_annotations(coco_cls, ann_file: str):
+    """Load large COCO JSON files with orjson when available.
+
+    The standard-library decoder remains the fallback so existing environments keep
+    working, while orjson avoids CPython decoder instability on memory-constrained hosts.
+    """
+    try:
+        import orjson
+    except ImportError:
+        return coco_cls(ann_file)
+
+    print("loading annotations into memory with orjson...")
+    with open(ann_file, "rb") as handle:
+        dataset = orjson.loads(handle.read())
+    coco = coco_cls()
+    coco.dataset = dataset
+    coco.createIndex()
+    return coco
+
+
 def make_transform(resize_size: int = 256, crop: bool = False):
     """Create image transform pipeline using torchvision v2.
     
@@ -118,7 +138,7 @@ class COCODataset(Dataset):
                 raise FileNotFoundError(f"Image directory not found at {self.image_dir}")
 
         # Load COCO annotations
-        self.coco = COCO(ann_file)
+        self.coco = _load_coco_annotations(COCO, ann_file)
         self.coco_mask_utils = coco_mask_utils
 
         # Use the same category mapping as COCO2017

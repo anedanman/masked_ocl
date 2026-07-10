@@ -358,13 +358,29 @@ def main():
     weight_decay = train_cfg.get("weight_decay", cfg.get("optimizer", {}).get("weight_decay", 1e-4))
 
     params = list(slot_attn.parameters()) + list(decoder.parameters())
+    crf_hyperparameter_cfg = dict(
+        (cfg.get("crf", {}) or {}).get("hyperparameters", {}) or {}
+    )
+    crf_hyperparameter_params = [
+        p
+        for p in params
+        if p.requires_grad and bool(getattr(p, "_is_crf_hyperparameter", False))
+    ]
+    crf_hyperparameter_ids = {id(p) for p in crf_hyperparameter_params}
+    regular_params = [p for p in params if id(p) not in crf_hyperparameter_ids]
+    crf_hyperparameter_lr = float(
+        crf_hyperparameter_cfg.get("learning_rate", float(lr) * 0.1)
+    )
+    crf_hyperparameter_weight_decay = float(
+        crf_hyperparameter_cfg.get("weight_decay", 0.0)
+    )
     optimizer_cfg = cfg.get("optimizer", {}) or {}
     optimizer_name = str(
         train_cfg.get("optimizer", optimizer_cfg.get("name", optimizer_cfg.get("type", "adamw")))
     ).lower()
     if optimizer_name == "muon":
-        muon_params = [p for p in params if p.requires_grad and p.ndim >= 2]
-        adamw_params = [p for p in params if p.requires_grad and p.ndim < 2]
+        muon_params = [p for p in regular_params if p.requires_grad and p.ndim >= 2]
+        adamw_params = [p for p in regular_params if p.requires_grad and p.ndim < 2]
         optimizers: List[torch.optim.Optimizer] = []
         if muon_params:
             optimizers.append(
@@ -378,25 +394,56 @@ def main():
                     adjust_lr_fn=optimizer_cfg.get("adjust_lr_fn", None),
                 )
             )
+        adamw_groups = []
         if adamw_params:
+            adamw_groups.append(
+                {
+                    "params": adamw_params,
+                    "lr": float(optimizer_cfg.get("adamw_lr", lr)),
+                    "weight_decay": weight_decay,
+                }
+            )
+        if crf_hyperparameter_params:
+            adamw_groups.append(
+                {
+                    "params": crf_hyperparameter_params,
+                    "lr": crf_hyperparameter_lr,
+                    "weight_decay": crf_hyperparameter_weight_decay,
+                }
+            )
+        if adamw_groups:
             optimizers.append(
-                torch.optim.AdamW(
-                    adamw_params,
-                    lr=float(optimizer_cfg.get("adamw_lr", lr)),
-                    weight_decay=weight_decay,
-                )
+                torch.optim.AdamW(adamw_groups)
             )
         optim = CombinedOptimizer(optimizers)
         print(
             f"Using torch.optim.Muon for {len(muon_params)} tensor params and AdamW fallback "
-            f"for {len(adamw_params)} vector/scalar params."
+            f"for {len(adamw_params)} vector/scalar params; "
+            f"{len(crf_hyperparameter_params)} CRF hyperparameters use "
+            f"lr={crf_hyperparameter_lr:g}."
         )
     elif optimizer_name == "adamw":
-        optim = torch.optim.AdamW(
-            params,
-            lr=lr,
-            weight_decay=weight_decay,
-        )
+        param_groups = [
+            {
+                "params": regular_params,
+                "lr": lr,
+                "weight_decay": weight_decay,
+            }
+        ]
+        if crf_hyperparameter_params:
+            param_groups.append(
+                {
+                    "params": crf_hyperparameter_params,
+                    "lr": crf_hyperparameter_lr,
+                    "weight_decay": crf_hyperparameter_weight_decay,
+                }
+            )
+        optim = torch.optim.AdamW(param_groups)
+        if crf_hyperparameter_params:
+            print(
+                f"Using lr={crf_hyperparameter_lr:g} for "
+                f"{len(crf_hyperparameter_params)} trainable CRF hyperparameters."
+            )
     else:
         raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Expected 'adamw' or 'muon'.")
 

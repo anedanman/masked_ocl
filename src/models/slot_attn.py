@@ -303,6 +303,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             appearance_cfg = dict(token_crf_cfg.get("appearance", {}) or {})
             slot_crf_cfg = dict(token_crf_cfg.get("slot_attention", {}) or {})
             compatibility_cfg = dict(token_crf_cfg.get("compatibility", {}) or {})
+            hyperparameter_cfg = dict(token_crf_cfg.get("hyperparameters", {}) or {})
 
             spatial_enabled = bool(spatial_cfg.get("enabled", True))
             appearance_enabled = bool(appearance_cfg.get("enabled", True))
@@ -341,6 +342,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
                 compatibility_num_heads=int(compatibility_cfg.get("num_heads", 4)),
                 compatibility_dropout=float(compatibility_cfg.get("dropout", 0.0)),
                 compatibility_output_norm=compatibility_cfg.get("output_norm", None),
+                trainable_hyperparameters=bool(hyperparameter_cfg.get("trainable", False)),
                 eps=float(token_crf_cfg.get("eps", epsilon)),
             )
 

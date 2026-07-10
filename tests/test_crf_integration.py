@@ -90,6 +90,46 @@ def test_token_feature_crf_supports_transformer_product_compatibility() -> None:
     assert "compatibility_offdiag_mean" in refined.stats
 
 
+def test_token_feature_crf_trains_positive_hyperparameters() -> None:
+    crf = TokenFeatureCRF(
+        num_iterations=2,
+        spatial_weight=3.0,
+        spatial_sigma=1.5,
+        appearance_weight=6.0,
+        appearance_sigma=0.35,
+        appearance_spatial_sigma=2.5,
+        unary_temperature=1.0,
+        slot_size=8,
+        compatibility_type="cosine_mlp",
+        compatibility_hidden_dim=16,
+        compatibility_projection_dim=8,
+        compatibility_temperature=1.0,
+        trainable_hyperparameters=True,
+    )
+    features = torch.randn(2, 8, 4, 4)
+    probs = torch.softmax(torch.randn(2, 16, 3), dim=-1)
+    slots = torch.randn(2, 3, 8)
+
+    context = crf.build_context(features)
+    refined = crf.refine(probs, context, slot_embeddings=slots)
+    weights = torch.linspace(0.1, 1.0, 16).view(1, 16, 1)
+    loss = (refined.refined_probs[..., :1] * weights).sum()
+    loss.backward()
+
+    hyperparameters = [
+        parameter
+        for parameter in crf.parameters()
+        if bool(getattr(parameter, "_is_crf_hyperparameter", False))
+    ]
+    assert len(hyperparameters) == 7
+    assert all(parameter.grad is not None for parameter in hyperparameters)
+    assert all(torch.isfinite(parameter.grad).all() for parameter in hyperparameters)
+    assert all(
+        float(value.detach()) > 0.0 for value in crf.hyperparameter_values().values()
+    )
+    assert "hyperparameter_spatial_weight" in refined.stats
+
+
 def test_slot_attention_returns_crf_info_when_enabled() -> None:
     slot_attn = MultiHeadSTEVESA(
         num_iterations=3,

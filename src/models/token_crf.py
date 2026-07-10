@@ -52,6 +52,7 @@ class TokenFeatureCRF(nn.Module):
         compatibility_num_heads: int = 4,
         compatibility_dropout: float = 0.0,
         compatibility_output_norm: Optional[str] = None,
+        trainable_hyperparameters: bool = False,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -73,6 +74,7 @@ class TokenFeatureCRF(nn.Module):
         self.normalize_features = bool(normalize_features)
         self.detach_features = bool(detach_features)
         self.unary_temperature = float(unary_temperature)
+        self.trainable_hyperparameters = bool(trainable_hyperparameters)
         compatibility_type = str(compatibility_type).lower()
         compatibility_type = {
             "disabled": "potts",
@@ -159,7 +161,52 @@ class TokenFeatureCRF(nn.Module):
                 nn.Linear(hidden_dim, projection_dim),
             )
         self.eps = float(eps)
+        self._init_trainable_hyperparameters()
         self._coord_cache: dict[tuple[int, int, str], torch.Tensor] = {}
+
+    def _init_trainable_hyperparameters(self) -> None:
+        names = (
+            "spatial_weight",
+            "spatial_sigma",
+            "appearance_weight",
+            "appearance_sigma",
+            "appearance_spatial_sigma",
+            "unary_temperature",
+            "compatibility_temperature",
+        )
+        for name in names:
+            value = float(getattr(self, name))
+            parameter_name = f"log_{name}"
+            if not self.trainable_hyperparameters:
+                self.register_parameter(parameter_name, None)
+                continue
+            if value <= 0.0:
+                raise ValueError(
+                    f"Trainable CRF hyperparameter '{name}' must start positive, got {value}."
+                )
+            parameter = nn.Parameter(torch.tensor(math.log(value), dtype=torch.float32))
+            parameter._is_crf_hyperparameter = True  # type: ignore[attr-defined]
+            self.register_parameter(parameter_name, parameter)
+
+    def _effective_hyperparameter(self, name: str) -> float | torch.Tensor:
+        parameter = getattr(self, f"log_{name}")
+        if parameter is None:
+            return float(getattr(self, name))
+        return parameter.exp().clamp_min(self.eps)
+
+    def hyperparameter_values(self) -> dict[str, float | torch.Tensor]:
+        return {
+            name: self._effective_hyperparameter(name)
+            for name in (
+                "spatial_weight",
+                "spatial_sigma",
+                "appearance_weight",
+                "appearance_sigma",
+                "appearance_spatial_sigma",
+                "unary_temperature",
+                "compatibility_temperature",
+            )
+        }
 
     def _normalize_compat_projection(self, projected: torch.Tensor) -> torch.Tensor:
         if self.compatibility_output_norm == "rms":
@@ -257,9 +304,10 @@ class TokenFeatureCRF(nn.Module):
     ) -> Optional[torch.Tensor]:
         if self.spatial_weight <= 0.0 or self.spatial_sigma <= 0.0:
             return None
+        spatial_sigma = self._effective_hyperparameter("spatial_sigma")
         coords = self._get_coords(height, width, device)
         dist2 = self._pairwise_distance_sq(coords)
-        kernel = torch.exp(-0.5 * dist2 / max(self.spatial_sigma * self.spatial_sigma, self.eps))
+        kernel = torch.exp(-0.5 * dist2 / (spatial_sigma * spatial_sigma))
         kernel = kernel.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
         return self._sparsify_and_normalize(kernel, token_mask)
 
@@ -274,6 +322,11 @@ class TokenFeatureCRF(nn.Module):
         if self.appearance_weight <= 0.0 or self.appearance_sigma <= 0.0:
             return None
 
+        appearance_sigma = self._effective_hyperparameter("appearance_sigma")
+        appearance_spatial_sigma = self._effective_hyperparameter(
+            "appearance_spatial_sigma"
+        )
+
         pairwise_features = features.detach() if self.detach_features else features
         pairwise_features = pairwise_features.float()
         if self.normalize_features:
@@ -286,7 +339,7 @@ class TokenFeatureCRF(nn.Module):
             diff = pairwise_features.unsqueeze(2) - pairwise_features.unsqueeze(1)
             dist2 = diff.pow(2).sum(dim=-1)
 
-        kernel = torch.exp(-0.5 * dist2 / max(self.appearance_sigma * self.appearance_sigma, self.eps))
+        kernel = torch.exp(-0.5 * dist2 / (appearance_sigma * appearance_sigma))
 
         if self.appearance_spatial_sigma > 0.0:
             coords = self._get_coords(height, width, features.device)
@@ -294,7 +347,7 @@ class TokenFeatureCRF(nn.Module):
             spatial_term = torch.exp(
                 -0.5
                 * spatial_dist2
-                / max(self.appearance_spatial_sigma * self.appearance_spatial_sigma, self.eps)
+                / (appearance_spatial_sigma * appearance_spatial_sigma)
             )
             kernel = kernel * spatial_term
 
@@ -377,7 +430,7 @@ class TokenFeatureCRF(nn.Module):
             else:
                 compat = F.softplus(sim)
 
-        compat = compat / max(self.compatibility_temperature, self.eps)
+        compat = compat / self._effective_hyperparameter("compatibility_temperature")
         if self.compatibility_diagonal == "zero":
             eye = torch.eye(num_slots, device=compat.device, dtype=torch.bool)
             compat = compat.masked_fill(eye.unsqueeze(0), 0.0)
@@ -407,7 +460,7 @@ class TokenFeatureCRF(nn.Module):
         q0 = probs.float().clamp_min(0.0)
         q0 = q0 / q0.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         unary = -torch.log(q0.clamp_min(self.eps))
-        unary = unary / max(self.unary_temperature, self.eps)
+        unary = unary / self._effective_hyperparameter("unary_temperature")
         q = q0
 
         if token_mask is not None:
@@ -429,14 +482,18 @@ class TokenFeatureCRF(nn.Module):
 
             if context.spatial_kernel is not None:
                 msg = torch.bmm(context.spatial_kernel, q)
-                pairwise = pairwise + self.spatial_weight * self._compatibility_message(
+                pairwise = pairwise + self._effective_hyperparameter(
+                    "spatial_weight"
+                ) * self._compatibility_message(
                     msg,
                     compatibility,
                 )
 
             if context.appearance_kernel is not None:
                 msg = torch.bmm(context.appearance_kernel, q)
-                pairwise = pairwise + self.appearance_weight * self._compatibility_message(
+                pairwise = pairwise + self._effective_hyperparameter(
+                    "appearance_weight"
+                ) * self._compatibility_message(
                     msg,
                     compatibility,
                 )
@@ -458,6 +515,9 @@ class TokenFeatureCRF(nn.Module):
             "confidence_before": confidence_before,
             "confidence_after": confidence_after,
         }
+        if self.trainable_hyperparameters:
+            for name, value in self.hyperparameter_values().items():
+                stats[f"hyperparameter_{name}"] = value.detach()
         if compatibility is not None:
             eye = torch.eye(compatibility.shape[-1], device=compatibility.device, dtype=torch.bool)
             offdiag = compatibility.masked_select(~eye.unsqueeze(0))

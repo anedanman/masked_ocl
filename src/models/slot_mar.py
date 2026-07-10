@@ -436,6 +436,7 @@ class SlotMARDecoder(nn.Module):
                 spatial_cfg = dict(token_crf_cfg.get("spatial", {}) or {})
                 appearance_cfg = dict(token_crf_cfg.get("appearance", {}) or {})
                 compatibility_cfg = dict(token_crf_cfg.get("compatibility", {}) or {})
+                hyperparameter_cfg = dict(token_crf_cfg.get("hyperparameters", {}) or {})
                 spatial_enabled = bool(spatial_cfg.get("enabled", True))
                 appearance_enabled = bool(appearance_cfg.get("enabled", True))
                 self.cross_token_crf = TokenFeatureCRF(
@@ -472,6 +473,9 @@ class SlotMARDecoder(nn.Module):
                     compatibility_num_heads=int(compatibility_cfg.get("num_heads", 4)),
                     compatibility_dropout=float(compatibility_cfg.get("dropout", 0.0)),
                     compatibility_output_norm=compatibility_cfg.get("output_norm", None),
+                    trainable_hyperparameters=bool(
+                        hyperparameter_cfg.get("trainable", False)
+                    ),
                     eps=float(token_crf_cfg.get("eps", eps)),
                 )
 
