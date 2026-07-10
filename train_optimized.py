@@ -1,5 +1,6 @@
 """Shared training utilities for MAR runs."""
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -71,6 +72,9 @@ def prepare_dataloaders(cfg: Dict[str, Any]) -> Dict[str, torch.utils.data.DataL
             train_prefetch_factor = None
 
     if dataset_type == "coco":
+        extra_train_image_dirs = list(data_cfg.get("extra_train_image_dirs", []) or [])
+        if bool(data_cfg.get("include_unlabeled", False)):
+            extra_train_image_dirs.append(os.path.join(data_cfg["root"], "unlabeled2017"))
         return get_coco_dataloaders(
             data_root=data_cfg["root"],
             train_batch_size=train_batch_size,
@@ -93,6 +97,7 @@ def prepare_dataloaders(cfg: Dict[str, Any]) -> Dict[str, torch.utils.data.DataL
             train_pin_memory=train_pin_memory,
             train_persistent_workers=train_persistent_workers,
             train_prefetch_factor=train_prefetch_factor,
+            train_extra_image_dirs=extra_train_image_dirs or None,
         )
     if dataset_type == "voc":
         return get_voc_dataloaders(

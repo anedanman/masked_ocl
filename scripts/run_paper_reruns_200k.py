@@ -38,6 +38,33 @@ VARIANTS = {
             "hyperparameters trained at 3e-5."
         ),
     },
+    "dinosaurv3_unlabeled": {
+        "run_name": "paper200k_05_dinosaurv3_unlabeled",
+        "base": "dinosaurv3",
+        "include_unlabeled": True,
+        "hypothesis": "DINOSAURv3 control trained on train2017 + unlabeled2017 images.",
+    },
+    "fixed_compat_unlabeled": {
+        "run_name": "paper200k_06_slot_crf_fixed_compat_unlabeled",
+        "base": "fixed_compat",
+        "include_unlabeled": True,
+        "hypothesis": "Slot-CRF fixed Potts compatibility trained on train2017 + unlabeled2017 images.",
+    },
+    "learned_compat_unlabeled": {
+        "run_name": "paper200k_07_slot_crf_learned_compat_unlabeled",
+        "base": "learned_compat",
+        "include_unlabeled": True,
+        "hypothesis": "Slot-CRF learned compatibility trained on train2017 + unlabeled2017 images.",
+    },
+    "trainable_hparams_unlabeled": {
+        "run_name": "paper200k_08_slot_crf_learned_compat_trainable_hparams_unlabeled",
+        "base": "trainable_hparams",
+        "include_unlabeled": True,
+        "hypothesis": (
+            "Slot-CRF learned compatibility with trainable CRF hyperparameters, "
+            "trained on train2017 + unlabeled2017 images."
+        ),
+    },
 }
 
 
@@ -92,6 +119,7 @@ def make_final_slot_crf_base() -> dict:
 
 def build_variant(variant_id: str) -> dict:
     spec = VARIANTS[variant_id]
+    base_id = spec.get("base", variant_id)
     cfg = copy.deepcopy(make_final_slot_crf_base())
     cfg["wandb"]["run_name"] = spec["run_name"]
     cfg["experiment"] = {
@@ -101,16 +129,19 @@ def build_variant(variant_id: str) -> dict:
         "training_updates": 200_002,
     }
 
-    if variant_id == "dinosaurv3":
+    if base_id == "dinosaurv3":
         cfg["crf"]["enabled"] = False
-    elif variant_id == "fixed_compat":
+    elif base_id == "fixed_compat":
         cfg["crf"]["compatibility"] = {"type": "potts"}
-    elif variant_id == "trainable_hparams":
+    elif base_id == "trainable_hparams":
         cfg["crf"]["hyperparameters"] = {
             "trainable": True,
             "learning_rate": 3.0e-5,
             "weight_decay": 0.0,
         }
+
+    if spec.get("include_unlabeled", False):
+        cfg["data"]["include_unlabeled"] = True
     return cfg
 
 

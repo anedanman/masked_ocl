@@ -95,6 +95,7 @@ class COCODataset(Dataset):
         return_masks: bool = True,
         properties_from_bboxes: bool = False,
         horizontal_flip_prob: float = 0.0,
+        extra_image_dirs: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
         if mode not in {"instance", "class"}:
@@ -164,13 +165,47 @@ class COCODataset(Dataset):
                 "height": img_info["height"],
             })
 
+        # Optionally extend with unannotated image directories (e.g. COCO
+        # unlabeled2017). These samples carry no annotations, so they are only
+        # valid for images-only training.
+        self.extra_image_dirs = [str(d) for d in (extra_image_dirs or [])]
+        self.num_extra_samples = 0
+        if self.extra_image_dirs:
+            if self.return_masks or self.return_properties:
+                raise ValueError(
+                    "extra_image_dirs adds unannotated images; it requires "
+                    "return_masks=False and return_properties=False."
+                )
+            extra_id = 10_000_000  # keep synthetic ids clear of real COCO ids
+            for image_dir in self.extra_image_dirs:
+                image_dir = os.path.abspath(image_dir)
+                if not os.path.isdir(image_dir):
+                    raise FileNotFoundError(f"Extra image directory not found at {image_dir}")
+                files = sorted(
+                    f for f in os.listdir(image_dir)
+                    if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                )
+                if not files:
+                    raise FileNotFoundError(f"No images found in extra image directory {image_dir}")
+                for name in files:
+                    self.samples.append({
+                        "image_id": extra_id,
+                        "image_file": os.path.join(image_dir, name),
+                        "width": 0,
+                        "height": 0,
+                    })
+                    extra_id += 1
+                self.num_extra_samples += len(files)
+
         self.filtered_out = 0
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def _load_image(self, sample: Dict[str, Any], horizontal_flip: bool = False) -> torch.Tensor:
-        img_path = os.path.join(self.image_dir, sample["image_file"])
+        img_path = sample["image_file"]
+        if not os.path.isabs(img_path):
+            img_path = os.path.join(self.image_dir, img_path)
         img = Image.open(img_path).convert("RGB")
         if horizontal_flip:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
@@ -510,6 +545,7 @@ def get_coco_dataloaders(
     train_pin_memory: bool = True,
     train_persistent_workers: Optional[bool] = None,
     train_prefetch_factor: Optional[int] = 2,
+    train_extra_image_dirs: Optional[List[str]] = None,
 ) -> Dict[str, torch.utils.data.DataLoader]:
     """
     Create COCO dataloaders for train and validation using panoptic annotations.
@@ -553,6 +589,7 @@ def get_coco_dataloaders(
         return_masks=train_return_masks,
         properties_from_bboxes=properties_from_bboxes,
         horizontal_flip_prob=train_horizontal_flip_prob,
+        extra_image_dirs=train_extra_image_dirs,
     )
 
     val_dataset = COCODataset(
