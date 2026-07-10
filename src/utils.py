@@ -614,6 +614,83 @@ def make_visual_grid(
     return grid
 
 
+def _diverging_colormap(x: torch.Tensor) -> torch.Tensor:
+    """Map values in [-1, 1] to a blue-white-red RGB image [3, H, W]."""
+    x = x.clamp(-1.0, 1.0)
+    r = 1.0 - torch.relu(-x)
+    g = 1.0 - x.abs()
+    b = 1.0 - torch.relu(x)
+    return torch.stack([r, g, b], dim=0)
+
+
+def make_compatibility_grid(
+    image: torch.Tensor,
+    slot_masks: torch.Tensor,
+    compat: torch.Tensor,
+    *,
+    field_alpha: float = 0.65,
+    outline_color: Tuple[float, float, float] = (0.0, 1.0, 0.0),
+) -> torch.Tensor:
+    """Visualize a slot-conditioned CRF compatibility matrix on top of slot masks.
+
+    Produces one row of panels:
+      [image | colored slot segmentation | SxS compatibility heatmap |
+       per-slot compatibility field for each of the S slots]
+
+    The per-slot field for slot i renders ``sum_j compat[i, j] * mask_j`` over
+    the image with a blue-white-red colormap (red = high penalty, i.e. regions
+    slot i is repelled from under the CRF pairwise term; with the
+    one_minus_cosine transform all values are >= 0 so panels are white-to-red).
+    Slot i's own soft region is outlined in ``outline_color``.
+
+    Args:
+        image: [3, H, W] normalized input image.
+        slot_masks: [S, H, W] soft slot assignment maps (e.g. CRF-refined
+            assignments upsampled to image resolution).
+        compat: [S, S] compatibility matrix for this image.
+    """
+    if torchvision is None:
+        raise ImportError("torchvision is required for visualization utils")
+    if slot_masks.ndim != 3:
+        raise ValueError("slot_masks must have shape [S, H, W]")
+    if compat.ndim != 2 or compat.shape[0] != compat.shape[1] or compat.shape[0] != slot_masks.shape[0]:
+        raise ValueError(
+            f"compat must be [S, S] matching slot_masks (S={slot_masks.shape[0]}), "
+            f"got {tuple(compat.shape)}."
+        )
+
+    num_slots, height, width = slot_masks.shape
+    image = image.float().cpu()
+    slot_masks = slot_masks.float().cpu()
+    compat = compat.float().cpu()
+
+    img_denorm = denormalize_image(image)
+    panels = [img_denorm, overlay_on_image(img_denorm, slot_masks)]
+
+    compat_scale = float(compat.abs().max().clamp_min(1e-8))
+    compat_img = _diverging_colormap(compat / compat_scale)
+    panels.append(
+        F.interpolate(compat_img.unsqueeze(0), size=(height, width), mode="nearest").squeeze(0)
+    )
+
+    # Compatibility fields: how strongly each pixel repels slot i, given the
+    # current soft masks of all other slots.
+    fields = torch.einsum("ij,jhw->ihw", compat, slot_masks)
+    field_scale = float(fields.abs().max().clamp_min(1e-8))
+    hard_masks = slot_masks > 0.5
+    for i in range(num_slots):
+        field_rgb = _diverging_colormap(fields[i] / field_scale)
+        panel = torch.clamp((1.0 - field_alpha) * img_denorm + field_alpha * field_rgb, 0.0, 1.0)
+        own = hard_masks[i].float()
+        dilated = F.max_pool2d(own.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1)
+        edge = (dilated.squeeze(0).squeeze(0) - own) > 0.5
+        for c, value in enumerate(outline_color):
+            panel[c][edge] = value
+        panels.append(panel)
+
+    return torchvision.utils.make_grid(panels, nrow=len(panels), padding=4)
+
+
 def merge_instance_masks_by_category(
     masks: torch.Tensor,
     categories: torch.Tensor,

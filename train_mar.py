@@ -62,6 +62,7 @@ from src.utils import (
     load_config,
     extract_features,
     attn_to_slot_masks,
+    make_compatibility_grid,
     make_visual_grid,
     merge_instance_masks_by_category,
     build_slot_model_components,
@@ -1218,6 +1219,8 @@ def main():
                 val_crf_stat_counts: Dict[str, int] = {}
                 viz_grids: List[torch.Tensor] = []
                 viz_target = int(cfg.get("wandb", {}).get("val_viz_count", 16)) if use_wandb else 0
+                compat_grids: List[torch.Tensor] = []
+                compat_viz_target = int(cfg.get("wandb", {}).get("compat_viz_count", 8)) if use_wandb else 0
                 target_metrics_active: Dict[str, bool] = {name: False for name in metrics_val}
 
                 for batch in val_loader:
@@ -1432,6 +1435,31 @@ def main():
                         )
                         viz_grids.append(grid)
 
+                    if (
+                        use_wandb
+                        and _TORCHVISION_AVAILABLE
+                        and slot_info is not None
+                        and len(compat_grids) < compat_viz_target
+                    ):
+                        compat_matrix = slot_info.get("compatibility_matrix", None)
+                        refined = slot_info.get("refined_assignments", None)
+                        if compat_matrix is not None and refined is not None:
+                            refined_masks = (
+                                refined[0].transpose(0, 1).reshape(-1, Hf, Wf).unsqueeze(0)
+                            )
+                            refined_masks_img = F.interpolate(
+                                refined_masks.float(),
+                                size=images.shape[-2:],
+                                mode="bilinear",
+                            ).squeeze(0)
+                            compat_grids.append(
+                                make_compatibility_grid(
+                                    images[0].detach().cpu(),
+                                    refined_masks_img.detach().cpu(),
+                                    compat_matrix[0].detach().float().cpu(),
+                                )
+                            )
+
                 val_loss = float(sum(val_losses) / len(val_losses)) if val_losses else float("nan")
                 results = {"val/loss": val_loss}
                 if val_sa_guidance_losses:
@@ -1497,6 +1525,12 @@ def main():
                     if viz_grids:
                         val_viz_grid = torchvision.utils.make_grid(viz_grids, nrow=4, padding=8)
                         results["val/viz"] = wandb.Image(val_viz_grid, caption="validation_grids")
+                    if compat_grids:
+                        compat_viz_grid = torch.cat(compat_grids, dim=1)
+                        results["val/compat_viz"] = wandb.Image(
+                            compat_viz_grid,
+                            caption="image | slots | compat matrix | per-slot repulsion fields",
+                        )
                     wandb.log(results, step=global_step)
 
                 if math.isfinite(val_loss) and val_loss < best_val_loss:

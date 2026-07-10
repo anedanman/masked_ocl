@@ -816,6 +816,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             "effective_attn_vis": last_iter_info.get("effective_attn_vis", attn_vis),
             "raw_assignments": last_iter_info.get("raw_assignments", None),
             "refined_assignments": last_iter_info.get("refined_assignments", None),
+            "compatibility_matrix": last_iter_info.get("compatibility_matrix", None),
             "crf_stats": last_iter_info.get("crf_stats", {}),
         }
         return slots, attn_vis, init_loss, info
@@ -855,6 +856,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
         refined_attn_vis = None
         raw_assignments = None
         refined_assignments = None
+        compatibility_matrix = None
         crf_stats: dict[str, torch.Tensor] = {}
         if compute_crf and token_crf_context is not None and self.token_crf is not None:
             raw_assignments = self._attn_to_assignments(raw_attn_vis)
@@ -866,6 +868,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             )
             refined_assignments = refinement.refined_probs
             refined_attn_vis = self._assignments_to_attn_vis(raw_attn_vis, refined_assignments)
+            compatibility_matrix = refinement.compatibility
             crf_stats = refinement.stats
             if apply_crf:
                 effective_attn_vis = self._apply_token_crf_mode(
@@ -902,6 +905,7 @@ class MultiHeadSTEVESA(ModelMixin, ConfigMixin):
             "effective_attn_vis": effective_attn_vis,
             "raw_assignments": raw_assignments,
             "refined_assignments": refined_assignments,
+            "compatibility_matrix": compatibility_matrix,
             "crf_stats": crf_stats,
         }
 

@@ -19,6 +19,8 @@ class TokenCRFContext:
 class TokenCRFRefinement:
     refined_probs: torch.Tensor
     stats: dict[str, torch.Tensor]
+    # Slot-slot compatibility matrix [B, S, S] (None for Potts).
+    compatibility: Optional[torch.Tensor] = None
 
 
 class TokenFeatureCRF(nn.Module):
@@ -532,4 +534,5 @@ class TokenFeatureCRF(nn.Module):
         return TokenCRFRefinement(
             refined_probs=q.to(dtype=orig_dtype),
             stats=stats,
+            compatibility=compatibility.detach() if compatibility is not None else None,
         )
